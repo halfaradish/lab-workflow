@@ -1,0 +1,5 @@
+# 在此添加实验依赖，例如:
+# requests>=2.32
+#
+# 安装到实验自己的 venv（不要装到全局）:
+#   .venv/bin/pip install -r requirements.txt

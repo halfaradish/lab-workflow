@@ -1,0 +1,835 @@
+"""Experiment lifecycle: create, inspect, archive, promote and discard."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from . import environment, gitutil
+from .environment import EnvOutcome
+from .errors import LabError, NotFoundError, StateError, UsageError
+from .registry import (
+    Registry,
+    active,
+    check_editable,
+    load_for_read,
+    normalize_ref,
+    set_status,
+    touch,
+)
+from .util import (
+    ACTIVE_STATUSES,
+    TEMPLATE_TECHNOLOGIES,
+    atomic_write_json,
+    atomic_write_text,
+    format_age,
+    format_date,
+    now_iso,
+    now_local,
+    slugify,
+    status_label,
+    unique,
+)
+from .workspace import (
+    ASSET_ROOT,
+    Workspace,
+    copy_tree_rendered,
+    ensure_agents_link,
+    render_template,
+)
+
+README_ASSET = ASSET_ROOT / "experiment_README.md"
+META_FILENAME = ".lab-meta.json"
+MANAGED_READMES = ("metadata", "description", "conclusion")
+
+
+@dataclass
+class CreateResult:
+    record: dict[str, Any]
+    path: Path
+    env: EnvOutcome = field(default_factory=EnvOutcome)
+    git_message: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class UpdateResult:
+    record: dict[str, Any]
+    previous_status: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ArchiveResult:
+    record: dict[str, Any]
+    path: Path
+    dirty: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PromoteResult:
+    record: dict[str, Any]
+    target: Path
+    source_path: Path
+    dirty: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DiscardResult:
+    record: dict[str, Any]
+    old_path: Path | None
+    warnings: list[str] = field(default_factory=list)
+
+
+# ----------------------------------------------------------------------
+# README and metadata mirror
+# ----------------------------------------------------------------------
+def _md_cell(value: Any) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "—"
+    return text.replace("|", "\\|")
+
+
+def _md_list(values: Any) -> str:
+    if isinstance(values, str):
+        values = [values]
+    items = [str(item).strip() for item in values or [] if str(item).strip()]
+    return ", ".join(items) if items else "—"
+
+
+def metadata_block(record: dict[str, Any]) -> str:
+    rows = [
+        ("状态", f"**{status_label(record.get('status', ''))}**"),
+        ("实验 ID", f"`{record.get('id', '')}`"),
+        ("模板", f"`{record.get('template', '')}`"),
+        ("分类", _md_cell(record.get("category"))),
+        ("摘要", _md_cell(record.get("summary"))),
+        ("标签", _md_list(record.get("tags"))),
+        ("技术", _md_list(record.get("technologies"))),
+        ("相关知识", _md_list(record.get("related_projects"))),
+        ("创建于", format_date(record.get("created_at"))),
+        ("更新于", format_date(record.get("updated_at"))),
+        ("路径", f"`{record.get('path', '')}`"),
+    ]
+    lines = ["| 字段 | 内容 |", "| --- | --- |"]
+    lines.extend(f"| {key} | {value} |" for key, value in rows)
+    return "\n".join(lines)
+
+
+def description_block(record: dict[str, Any]) -> str:
+    text = str(record.get("description") or "").strip()
+    return text if text else "_（待补充：一句话说明这个实验想验证什么。）_"
+
+
+def conclusion_block(record: dict[str, Any]) -> str:
+    text = str(record.get("conclusion") or "").strip()
+    return text if text else "_（待补充：实验结束或 promote 前写下结论。）_"
+
+
+def render_readme(workspace: Workspace, record: dict[str, Any]) -> str:
+    if not README_ASSET.is_file():
+        raise LabError("lab 安装不完整：找不到实验 README 模板")
+    mapping = {
+        "name": record.get("name", ""),
+        "id": record.get("id", ""),
+        "slug": record.get("slug", ""),
+        "template": record.get("template", ""),
+        "created_at_display": format_date(record.get("created_at")),
+        "workspace_root": str(workspace.root),
+        "lab_cmd": workspace.cli_path,
+        "metadata_block": metadata_block(record),
+        "description_block": description_block(record),
+        "conclusion_block": conclusion_block(record),
+    }
+    return render_template(README_ASSET.read_text(encoding="utf-8"), mapping)
+
+
+def _replace_managed(text: str, name: str, content: str) -> tuple[str, bool]:
+    pattern = re.compile(
+        rf"(<!-- lab:{re.escape(name)}:start -->).*?(<!-- lab:{re.escape(name)}:end -->)",
+        re.DOTALL,
+    )
+    if not pattern.search(text):
+        return text, False
+
+    def replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}\n{content}\n{match.group(2)}"
+
+    return pattern.sub(replace, text, count=1), True
+
+
+def sync_readme(workspace: Workspace, record: dict[str, Any]) -> list[str]:
+    """Refresh the managed blocks of an experiment README.
+
+    User-written sections are never touched. A README whose markers were
+    removed is left alone deliberately.
+    """
+
+    path = workspace.experiment_path(record)
+    if path is None:
+        return []
+    readme = path / "README.md"
+    if not path.exists():
+        return [f"实验目录不存在，无法更新 README: {path}"]
+    if not readme.exists():
+        try:
+            atomic_write_text(readme, render_readme(workspace, record))
+        except OSError as exc:
+            return [f"无法生成 README: {exc}"]
+        return [f"README 缺失，已重新生成: {readme}"]
+    try:
+        text = readme.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"无法读取 README: {exc}"]
+    original = text
+    text, _ = _replace_managed(text, "metadata", metadata_block(record))
+    text, _ = _replace_managed(text, "description", description_block(record))
+    text, _ = _replace_managed(text, "conclusion", conclusion_block(record))
+    if text != original:
+        try:
+            atomic_write_text(readme, text)
+        except OSError as exc:
+            return [f"无法更新 README: {exc}"]
+    return []
+
+
+def write_meta(workspace: Workspace, record: dict[str, Any]) -> list[str]:
+    path = workspace.experiment_path(record)
+    if path is None or not path.exists():
+        return []
+    try:
+        atomic_write_json(path / META_FILENAME, record)
+    except OSError as exc:
+        return [f"无法写入 .lab-meta.json: {exc}"]
+    return []
+
+
+def _sync_all(workspace: Workspace, record: dict[str, Any]) -> list[str]:
+    warnings = write_meta(workspace, record)
+    warnings.extend(sync_readme(workspace, record))
+    return warnings
+
+
+# ----------------------------------------------------------------------
+# Create
+# ----------------------------------------------------------------------
+def _normalize_name(raw: str) -> tuple[str, str]:
+    slug = slugify(raw)
+    display = " ".join(str(raw or "").strip().split()) or slug
+    return display, slug
+
+
+def _unique_slug(records: list[dict[str, Any]], slug: str) -> None:
+    for record in records:
+        if record.get("slug") == slug:
+            raise UsageError(
+                f"名称 '{slug}' 已被实验 {record.get('id')} 使用；请换一个名称"
+            )
+
+
+def _default_technologies(template: str, provided: list[str]) -> list[str]:
+    values = [*TEMPLATE_TECHNOLOGIES.get(template, []), *provided]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item.casefold() in seen:
+            continue
+        seen.add(item.casefold())
+        result.append(item)
+    return result
+
+
+def create_experiment(
+    workspace: Workspace,
+    name: str,
+    *,
+    template: str = "general",
+    description: str = "",
+    tags: list[str] | None = None,
+    category: str = "",
+    technologies: list[str] | None = None,
+    related_projects: list[str] | None = None,
+    no_git: bool = False,
+    no_env: bool = False,
+) -> CreateResult:
+    display_name, slug = _normalize_name(name)
+    if workspace.registry_path.parent.is_dir():
+        available = [
+            item.name
+            for item in workspace.templates.iterdir()
+            if item.is_dir() and not item.name.startswith(".")
+        ] if workspace.templates.is_dir() else []
+        if template not in available:
+            allowed = ", ".join(sorted(available)) or "无"
+            raise UsageError(f"未知模板 '{template}'；可用模板: {allowed}")
+
+    result = CreateResult(record={}, path=Path(), env=EnvOutcome())
+    created_dir: Path | None = None
+    with workspace.lock():
+        records = Registry(workspace).load()
+        _unique_slug(records, slug)
+        registry = Registry(workspace)
+        identifier = registry.next_id(records)
+        created_at = now_iso()
+        folder = f"{identifier}-{slug}"
+        path = workspace.active / folder
+        if path.exists():
+            raise StateError(f"实验目录已存在但不是 registry 记录（孤立目录）: {path}")
+        template_dir = workspace.template_path(template)
+        if not template_dir.is_dir():
+            raise UsageError(f"模板目录不存在: {template_dir}")
+
+        display_template = {
+            "python": "Python",
+            "node": "Node.js",
+            "general": "通用",
+        }.get(template, template)
+        mapping = {
+            "id": identifier,
+            "name": display_name,
+            "slug": slug,
+            "folder": folder,
+            "template": template,
+            "date": format_date(created_at),
+            "created_at": created_at,
+            "workspace_root": str(workspace.root),
+            "lab_cmd": workspace.cli_path,
+            "description": description.strip(),
+        }
+        try:
+            copy_tree_rendered(template_dir, path, mapping)
+            ensure_agents_link(workspace, path)
+            created_dir = path
+
+            record: dict[str, Any] = {
+                "id": identifier,
+                "name": display_name,
+                "slug": slug,
+                "path": workspace.relative(path),
+                "status": "created",
+                "template": template,
+                "template_label": display_template,
+                "created_at": created_at,
+                "updated_at": created_at,
+                "status_changed_at": created_at,
+                "description": description.strip(),
+                "tags": unique(str(tag).strip() for tag in (tags or []) if str(tag).strip()),
+                "category": category.strip(),
+                "summary": "",
+                "conclusion": "",
+                "technologies": _default_technologies(template, technologies or []),
+                "related_projects": unique(
+                    str(item).strip() for item in (related_projects or []) if str(item).strip()
+                ),
+                "git": False,
+                "env": None,
+            }
+            atomic_write_text(path / "README.md", render_readme(workspace, record))
+
+            env_outcome = environment.setup_environment(path, template, enabled=not no_env)
+            record["env"] = env_outcome.record
+            if no_env and template in {"python", "node"}:
+                record["env_skipped"] = True
+
+            if no_git:
+                git_message = "已跳版本控制（--no-git）"
+            else:
+                git_ok, git_message = gitutil.init_repo(path)
+                record["git"] = bool(git_ok)
+            result.git_message = git_message
+
+            registry.write_record(record)
+            result.record = record
+            result.path = path
+            result.env = env_outcome
+            result.warnings.extend(env_outcome.warnings)
+            result.warnings.extend(_sync_all(workspace, record))
+        except Exception:
+            if created_dir is not None and created_dir.exists():
+                shutil.rmtree(created_dir, ignore_errors=True)
+            raise
+    return result
+
+
+# ----------------------------------------------------------------------
+# Read
+# ----------------------------------------------------------------------
+def collect_records(
+    workspace: Workspace,
+    *,
+    statuses: list[str] | None = None,
+    include_all: bool = False,
+    tags: list[str] | None = None,
+    template: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    records = load_for_read(workspace)
+    if include_all:
+        selected = records
+    elif statuses:
+        wanted = set(statuses)
+        selected = [record for record in records if record.get("status") in wanted]
+    else:
+        selected = [record for record in records if active(record)]
+    if tags:
+        wanted_tags = {tag.casefold() for tag in tags}
+        selected = [
+            record
+            for record in selected
+            if wanted_tags.issubset({str(tag).casefold() for tag in record.get("tags", [])})
+        ]
+    if template:
+        selected = [
+            record
+            for record in selected
+            if str(record.get("template", "")).casefold() == template.casefold()
+        ]
+    if category:
+        selected = [
+            record
+            for record in selected
+            if str(record.get("category", "")).casefold() == category.casefold()
+        ]
+    selected.sort(key=lambda record: (str(record.get("created_at", "")), str(record.get("id", ""))), reverse=True)
+    return selected
+
+
+def find_experiment(workspace: Workspace, reference: str, records=None) -> dict[str, Any]:
+    registry = Registry(workspace)
+    return registry.find(normalize_ref(reference), records)
+
+
+def record_path(workspace: Workspace, record: dict[str, Any]) -> Path | None:
+    try:
+        return workspace.experiment_path(record)
+    except StateError:
+        return None
+
+
+def record_exists(workspace: Workspace, record: dict[str, Any]) -> bool:
+    path = record_path(workspace, record)
+    return bool(path and path.is_dir())
+
+
+def show_text(workspace: Workspace, record: dict[str, Any]) -> str:
+    path = record_path(workspace, record)
+    exists = bool(path and path.is_dir())
+    lines = [
+        f"实验: {record.get('name', '')}",
+        f"ID: {record.get('id', '')}",
+        f"状态: {status_label(record.get('status', ''))}"
+        f"（{format_date(record.get('status_changed_at') or record.get('created_at'))}，"
+        f"{format_age(record.get('status_changed_at') or record.get('created_at'))}）",
+        f"路径: {path if path else record.get('path', '-')}"
+        + ("" if exists or record.get("status") in {"discarded", "promoted"} else "  ⚠ 目录缺失"),
+        f"创建: {format_date(record.get('created_at'))}",
+        f"更新: {format_date(record.get('updated_at'))}",
+        f"模板: {record.get('template', '-')}",
+        f"分类: {record.get('category') or '未分类'}",
+        f"标签: {_md_list(record.get('tags'))}",
+        f"技术: {_md_list(record.get('technologies'))}",
+        f"相关知识: {_md_list(record.get('related_projects'))}",
+    ]
+    if record.get("git"):
+        dirty = []
+        head = None
+        if exists and path:
+            dirty = gitutil.status_lines(path) or []
+            head = gitutil.head_commit(path)
+        state = "干净" if not dirty else f"有 {len(dirty)} 项未提交更改"
+        lines.append(f"Git: {state}" + (f"（{head}）" if head else ""))
+    else:
+        lines.append("Git: 未初始化")
+    lines.append(
+        "环境: 未创建（--no-env）"
+        if record.get("env_skipped")
+        else f"环境: {environment.environment_summary(record.get('env'))}"
+    )
+    if record.get("archived_at"):
+        lines.append(f"归档于: {format_date(record.get('archived_at'))}")
+    if record.get("promoted_at"):
+        lines.append(f"promote 于: {format_date(record.get('promoted_at'))}")
+        lines.append(f"promote 到: {record.get('promoted_to', '-')}")
+    if record.get("discarded_at"):
+        reason = record.get("discarded_reason")
+        suffix = f"（{reason}）" if reason else ""
+        lines.append(f"删除于: {format_date(record.get('discarded_at'))}{suffix}")
+    if exists and path:
+        lines.append(f"README: {path / 'README.md'}")
+    lines.append("")
+    if record.get("description"):
+        lines.append("描述:")
+        lines.append(str(record["description"]))
+    if record.get("summary"):
+        lines.append("摘要:")
+        lines.append(str(record["summary"]))
+    if record.get("conclusion"):
+        lines.append("结论:")
+        lines.append(str(record["conclusion"]))
+    return "\n".join(lines).rstrip()
+
+
+# ----------------------------------------------------------------------
+# Update
+# ----------------------------------------------------------------------
+def _require_editable(workspace: Workspace, reference: str) -> dict[str, Any]:
+    record = find_experiment(workspace, reference)
+    check_editable(record)
+    return record
+
+
+def update_status(workspace: Workspace, reference: str, status: str) -> UpdateResult:
+    wanted = status.strip().lower()
+    aliases = {"start": "running", "done": "success", "ok": "success"}
+    wanted = aliases.get(wanted, wanted)
+    if wanted not in ACTIVE_STATUSES:
+        raise UsageError(
+            "status 只接受 created / running / success；归档请用 lab archive"
+        )
+    with workspace.lock():
+        registry = Registry(workspace)
+        record = find_experiment(workspace, reference, registry.load())
+        check_editable(record)
+        previous = str(record.get("status", ""))
+        if previous == wanted:
+            return UpdateResult(record=record, previous_status=previous)
+        set_status(record, wanted)
+        registry.write_record(record)
+        warnings = _sync_all(workspace, record)
+    return UpdateResult(record=record, previous_status=previous, warnings=warnings)
+
+
+def update_meta(
+    workspace: Workspace,
+    reference: str,
+    *,
+    description: str | None = None,
+    summary: str | None = None,
+    conclusion: str | None = None,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    technologies: list[str] | None = None,
+    related_projects: list[str] | None = None,
+) -> UpdateResult:
+    provided = [
+        value
+        for value in (description, summary, conclusion, category, tags, technologies, related_projects)
+        if value is not None
+    ]
+    if not provided:
+        raise UsageError("至少提供一个要更新的字段")
+    with workspace.lock():
+        registry = Registry(workspace)
+        record = find_experiment(workspace, reference, registry.load())
+        check_editable(record)
+        if description is not None:
+            record["description"] = description.strip()
+        if summary is not None:
+            record["summary"] = summary.strip()
+        if conclusion is not None:
+            record["conclusion"] = conclusion.strip()
+        if category is not None:
+            record["category"] = category.strip()
+        if tags is not None:
+            record["tags"] = unique(tag.strip() for tag in tags if tag.strip())
+        if technologies is not None:
+            record["technologies"] = unique(item.strip() for item in technologies if item.strip())
+        if related_projects is not None:
+            record["related_projects"] = unique(
+                item.strip() for item in related_projects if item.strip()
+            )
+        touch(record)
+        registry.write_record(record)
+        warnings = _sync_all(workspace, record)
+    return UpdateResult(record=record, warnings=warnings)
+
+
+# ----------------------------------------------------------------------
+# Move helpers
+# ----------------------------------------------------------------------
+def _dirty_lines(path: Path) -> list[str]:
+    return gitutil.status_lines(path) or []
+
+
+def _dirty_message(lines: list[str], limit: int = 5) -> str:
+    shown = "; ".join(line.strip() for line in lines[:limit])
+    if len(lines) > limit:
+        shown += f"; …（共 {len(lines)} 项）"
+    return shown
+
+
+def _archive_target(workspace: Workspace, record: dict[str, Any]) -> Path:
+    return workspace.archived_path(str(record.get("slug")), now_local())
+
+
+def archive_experiment(workspace: Workspace, reference: str, *, force: bool = False) -> ArchiveResult:
+    with workspace.lock():
+        registry = Registry(workspace)
+        record = find_experiment(workspace, reference, registry.load())
+        if record.get("status") == "archived":
+            raise StateError(f"实验 {record.get('id')} 已经是 ARCHIVED")
+        if record.get("status") not in ACTIVE_STATUSES:
+            raise StateError(f"当前状态 {status_label(record.get('status', ''))} 不能归档")
+        source = workspace.experiment_path(record)
+        if source is None or not source.is_dir():
+            raise StateError(f"实验目录不存在: {record.get('path')}")
+        dirty = _dirty_lines(source)
+        if dirty and not force:
+            raise StateError(
+                "实验存在未提交更改：" + _dirty_message(dirty) + "。确认后加 --force 再归档"
+            )
+        target = _archive_target(workspace, record)
+        if target.exists():
+            raise StateError(f"归档目标已存在: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        previous_status = record.get("status")
+        try:
+            shutil.move(str(source), str(target))
+        except OSError as exc:
+            raise StateError(f"归档移动失败: {exc}") from exc
+        try:
+            record["path"] = workspace.relative(target)
+            set_status(record, "archived")
+            record["archived_at"] = now_iso()
+            record["archived_from_status"] = previous_status
+            registry.write_record(record)
+        except Exception:
+            try:
+                shutil.move(str(target), str(source))
+            except OSError:
+                pass
+            raise
+        warnings = _sync_all(workspace, record)
+    return ArchiveResult(record=record, path=target, dirty=dirty, warnings=warnings)
+
+
+# ----------------------------------------------------------------------
+# Promote
+# ----------------------------------------------------------------------
+PROMOTE_IGNORE = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+    ".lab-meta.json",
+    ".DS_Store",
+}
+
+
+def _copy_project(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(source.iterdir(), key=lambda item: item.name):
+        name = entry.name
+        if name in PROMOTE_IGNORE:
+            continue
+        destination = target / name
+        if entry.is_symlink():
+            if name == "AGENTS.md":
+                # The workspace-level AGENTS.md is a lab-internal link.
+                continue
+            try:
+                os.symlink(os.readlink(entry), destination)
+            except OSError:
+                if entry.is_dir():
+                    shutil.copytree(entry, destination, symlinks=True)
+                else:
+                    shutil.copy2(entry, destination)
+        elif entry.is_dir():
+            _copy_project(entry, destination)
+        elif entry.is_file():
+            shutil.copy2(entry, destination)
+
+
+def default_promote_target(record: dict[str, Any]) -> Path:
+    return Path.home() / "workspace" / str(record.get("slug", ""))
+
+
+def promote_experiment(
+    workspace: Workspace,
+    reference: str,
+    *,
+    target: Path | None = None,
+    force: bool = False,
+) -> PromoteResult:
+    with workspace.lock():
+        registry = Registry(workspace)
+        record = find_experiment(workspace, reference, registry.load())
+        status = record.get("status")
+        if status == "promoted":
+            raise StateError(
+                f"实验 {record.get('id')} 已经 promote 到 {record.get('promoted_to')}"
+            )
+        if status == "discarded":
+            raise StateError(f"实验 {record.get('id')} 已删除，无法 promote")
+        if status not in {"success", "archived"}:
+            raise StateError(
+                "只有 SUCCESS 或 ARCHIVED 的实验可以 promote；"
+                f"当前是 {status_label(status or '')}，可先运行 lab status {record.get('id')} success"
+            )
+        source = workspace.experiment_path(record)
+        if source is None or not source.is_dir():
+            raise StateError(f"实验目录不存在: {record.get('path')}")
+
+        dirty = _dirty_lines(source)
+        if dirty and not force:
+            raise StateError(
+                "实验存在未提交更改：" + _dirty_message(dirty) + "。确认后加 --force 再 promote"
+            )
+
+        destination = (target or default_promote_target(record)).expanduser()
+        if not destination.is_absolute():
+            destination = (Path.cwd() / destination).resolve()
+        else:
+            destination = destination.resolve()
+        if destination == workspace.root or destination.is_relative_to(workspace.root):
+            raise UsageError("promote 目标不能位于工作台 ~/lab 内")
+        if destination == source or destination.is_relative_to(source):
+            raise UsageError("promote 目标不能是实验目录本身")
+        if destination.exists():
+            if not destination.is_dir():
+                raise StateError(f"promote 目标已存在且不是目录: {destination}")
+            if any(destination.iterdir()):
+                raise StateError(f"promote 目标目录非空，请换一个空目录: {destination}")
+
+        created_target = not destination.exists()
+        try:
+            _copy_project(source, destination)
+        except OSError as exc:
+            if created_target and destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
+            raise StateError(f"复制实验文件失败: {exc}") from exc
+
+        previous_status = status
+        archive_path: Path | None = None
+        if status == "success":
+            candidate = _archive_target(workspace, record)
+            if candidate.exists():
+                if created_target:
+                    shutil.rmtree(destination, ignore_errors=True)
+                raise StateError(f"归档目标已存在: {candidate}")
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(source), str(candidate))
+            except OSError as exc:
+                if created_target:
+                    shutil.rmtree(destination, ignore_errors=True)
+                raise StateError(f"promote 后归档源实验失败: {exc}") from exc
+            archive_path = candidate
+            record["path"] = workspace.relative(candidate)
+            record["archived_at"] = now_iso()
+            record["archived_from_status"] = previous_status
+
+        try:
+            set_status(record, "promoted")
+            record["promoted_at"] = now_iso()
+            record["promoted_to"] = str(destination)
+            registry.write_record(record)
+        except Exception:
+            if archive_path is not None and archive_path.exists():
+                try:
+                    shutil.move(str(archive_path), str(source))
+                except OSError:
+                    pass
+            if created_target:
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+        warnings = _sync_all(workspace, record)
+    return PromoteResult(
+        record=record,
+        target=destination,
+        source_path=archive_path or source,
+        dirty=dirty,
+        warnings=warnings,
+    )
+
+
+# ----------------------------------------------------------------------
+# Discard / clean deletion
+# ----------------------------------------------------------------------
+def _trash_root(workspace: Workspace) -> Path:
+    root = workspace.root / ".trash"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def discard_experiment(
+    workspace: Workspace,
+    reference: str,
+    *,
+    reason: str = "manual",
+) -> DiscardResult:
+    """Delete an experiment directory and retain a registry tombstone.
+
+    Callers are responsible for confirmation; this function is also used
+    by ``clean`` after its own safety checks.
+    """
+
+    with workspace.lock():
+        registry = Registry(workspace)
+        record = find_experiment(workspace, reference, registry.load())
+        status = record.get("status")
+        if status == "discarded":
+            raise StateError(f"实验 {record.get('id')} 已经是 DISCARDED")
+        if status == "promoted":
+            raise StateError(f"实验 {record.get('id')} 已 promote，不能再 discard")
+        source = workspace.experiment_path(record)
+        old_path = source
+        existing = bool(source and source.is_dir())
+        trash_parent: Path | None = None
+        trashed: Path | None = None
+        if source and source.exists():
+            trash_parent = Path(tempfile.mkdtemp(prefix="discard-", dir=_trash_root(workspace)))
+            trashed = trash_parent / "experiment"
+            try:
+                shutil.move(str(source), str(trashed))
+            except OSError as exc:
+                shutil.rmtree(trash_parent, ignore_errors=True)
+                raise StateError(f"无法移走实验目录: {exc}") from exc
+
+        previous_status = status
+        try:
+            if trashed is not None:
+                set_status(record, "discarded")
+                record["discarded_at"] = now_iso()
+                record["discarded_reason"] = reason
+                record["discarded_from_status"] = previous_status
+            else:
+                # Missing directory: still close the record.
+                record["status"] = "discarded"
+                record["status_changed_at"] = now_iso()
+                record["updated_at"] = now_iso()
+                record["discarded_at"] = now_iso()
+                record["discarded_reason"] = reason + " (目录已缺失)"
+            registry.write_record(record)
+        except Exception:
+            if trashed is not None and source is not None and trashed.exists():
+                try:
+                    shutil.move(str(trashed), str(source))
+                except OSError:
+                    pass
+            if trash_parent is not None:
+                shutil.rmtree(trash_parent, ignore_errors=True)
+            raise
+
+        warnings: list[str] = []
+        if trash_parent is not None:
+            try:
+                shutil.rmtree(trash_parent)
+            except OSError as exc:
+                warnings.append(f"临时删除目录清理失败（不影响 registry）: {exc}")
+    return DiscardResult(record=record, old_path=old_path if existing else None, warnings=warnings)

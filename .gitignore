@@ -1,0 +1,27 @@
+# 本地设计稿，永远不提交
+docs/original.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / 工具
+node_modules/
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
+
+# 本地环境与密钥
+.env
+.env.*
+*.local
+*.log

@@ -1,0 +1,259 @@
+"""Workspace layout, initialization and locking."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import shutil
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from .errors import LabError, StateError
+from .util import atomic_write_text, now_local, now_iso
+
+ASSET_ROOT = Path(__file__).resolve().parent / "assets"
+TEMPLATE_ROOT = ASSET_ROOT / "templates"
+MANAGED_ASSETS = {
+    "AGENTS.md": ASSET_ROOT / "AGENTS.md",
+    "README.md": ASSET_ROOT / "workspace_README.md",
+    "bin/README.md": ASSET_ROOT / "bin_README.md",
+}
+SKELETON_DIRS = ("active", "archive", "templates", "registry", "bin")
+
+
+def default_root() -> Path:
+    """The fixed first-version workspace root: ``~/lab``."""
+
+    return Path.home() / "lab"
+
+
+class Workspace:
+    """Paths and lifecycle for one lab workspace."""
+
+    def __init__(self, root: Path | None = None):
+        self.root = (root or default_root()).expanduser().resolve()
+        self.active = self.root / "active"
+        self.archive = self.root / "archive"
+        self.templates = self.root / "templates"
+        self.registry_dir = self.root / "registry"
+        self.registry_path = self.registry_dir / "experiments.jsonl"
+        self.lock_path = self.registry_dir / ".lock"
+        self.bin_dir = self.root / "bin"
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+    def __str__(self) -> str:
+        return str(self.root)
+
+    def ensure(self) -> list[str]:
+        """Create missing workspace structure; never overwrite user files.
+
+        Returns a list of created paths relative to the workspace root.
+        """
+
+        if self.root.exists() and not self.root.is_dir():
+            raise LabError(f"工作台路径不是目录: {self.root}")
+
+        if not TEMPLATE_ROOT.is_dir():
+            raise LabError("lab 安装不完整：找不到内置模板目录")
+
+        created: list[str] = []
+        if not self.root.exists():
+            self.root.mkdir(parents=True)
+            created.append(".")
+
+        for name in SKELETON_DIRS:
+            path = self.root / name
+            if not path.exists():
+                path.mkdir(parents=True)
+                created.append(name + "/")
+            elif not path.is_dir():
+                raise LabError(f"工作台结构冲突：{path} 不是目录")
+
+        cli_path = self.cli_path
+        mapping = {
+            "workspace_root": str(self.root),
+            "lab_cmd": cli_path,
+            "date": now_local().strftime("%Y-%m-%d"),
+            "generated_at": now_iso(),
+        }
+        for relative, source in MANAGED_ASSETS.items():
+            destination = self.root / relative
+            if destination.exists():
+                continue
+            if not source.is_file():
+                raise LabError(f"lab 安装不完整：缺少 {source}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            text = source.read_text(encoding="utf-8")
+            atomic_write_text(destination, render_template(text, mapping))
+            created.append(relative)
+
+        self._copy_missing_tree(TEMPLATE_ROOT, self.templates, created, prefix="templates/")
+
+        if not self.registry_path.exists():
+            atomic_write_text(self.registry_path, "")
+            created.append("registry/experiments.jsonl")
+
+        return created
+
+    @property
+    def cli_path(self) -> str:
+        """Best known path of the ``lab`` executable for documentation."""
+
+        repo_root = ASSET_ROOT.parents[2]
+        candidate = repo_root / "bin" / "lab"
+        if candidate.is_file():
+            return str(candidate)
+        found = shutil.which("lab")
+        return found or "lab"
+
+    def _copy_missing_tree(
+        self,
+        source: Path,
+        destination: Path,
+        created: list[str],
+        *,
+        prefix: str = "",
+    ) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in sorted(source.iterdir(), key=lambda p: p.name):
+            target = destination / item.name
+            relative = prefix + item.name
+            if item.is_dir():
+                if target.exists() and not target.is_dir():
+                    raise LabError(f"模板结构冲突：{target} 不是目录")
+                if not target.exists():
+                    target.mkdir()
+                    created.append(relative + "/")
+                self._copy_missing_tree(item, target, created, prefix=relative + "/")
+            else:
+                if target.exists():
+                    continue
+                shutil.copy2(item, target)
+                created.append(relative)
+
+    # ------------------------------------------------------------------
+    # Paths
+    # ------------------------------------------------------------------
+    def experiment_path(self, record: dict) -> Path | None:
+        """Absolute path stored in a record, guarded against escaping root."""
+
+        relative = record.get("path")
+        if not relative:
+            return None
+        path = (self.root / str(relative)).resolve()
+        if path != self.root and not path.is_relative_to(self.root):
+            raise StateError(f"registry 中的实验路径越界: {relative}")
+        return path
+
+    def relative(self, path: Path) -> str:
+        resolved = path.expanduser().resolve()
+        if resolved == self.root or not resolved.is_relative_to(self.root):
+            raise StateError(f"路径不在工作台内: {path}")
+        return resolved.relative_to(self.root).as_posix()
+
+    def archived_path(self, slug: str, when=None):
+        when = when or now_local()
+        return self.archive / when.strftime("%Y") / when.strftime("%m") / slug
+
+    def available_templates(self) -> list[str]:
+        if not self.templates.is_dir():
+            return []
+        return sorted(
+            item.name
+            for item in self.templates.iterdir()
+            if item.is_dir() and not item.name.startswith(".")
+        )
+
+    def template_path(self, name: str) -> Path:
+        return self.templates / name
+
+    # ------------------------------------------------------------------
+    # Locking
+    # ------------------------------------------------------------------
+    @contextmanager
+    def lock(self, *, exclusive: bool = True) -> Iterator[None]:
+        """Serialize registry mutations with an advisory file lock."""
+
+        self.registry_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.lock_path, "a+", encoding="utf-8") as handle:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def render_template(text: str, mapping: dict[str, object]) -> str:
+    """Replace ``{{key}}`` placeholders in one pass."""
+
+    import re
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in mapping:
+            return match.group(0)
+        return str(mapping[key])
+
+    return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", replace, text)
+
+
+def copy_tree_rendered(source: Path, destination: Path, mapping: dict[str, object]) -> None:
+    """Copy a template tree, rendering text files through the mapping."""
+
+    destination.mkdir(parents=True, exist_ok=False)
+    text_suffixes = {
+        ".md",
+        ".txt",
+        ".py",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".json",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".sh",
+        ".cfg",
+        ".ini",
+        ".gitignore",
+    }
+    for item in sorted(source.iterdir(), key=lambda p: p.name):
+        target = destination / item.name
+        if item.is_dir():
+            copy_tree_rendered(item, target, mapping)
+        else:
+            if item.name == ".gitignore" or item.suffix.lower() in text_suffixes:
+                try:
+                    text = item.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    shutil.copy2(item, target)
+                else:
+                    atomic_write_text(target, render_template(text, mapping))
+                    shutil.copymode(item, target)
+            else:
+                shutil.copy2(item, target)
+
+
+def ensure_agents_link(workspace: Workspace, experiment_dir: Path) -> None:
+    """Expose the workspace AGENTS.md inside every experiment directory.
+
+    Agent runtimes usually read AGENTS.md from the current directory. A
+    symlink keeps the rules current without copying them into every
+    experiment. Fall back to a copy on filesystems without symlinks.
+    """
+
+    source = workspace.root / "AGENTS.md"
+    if not source.is_file():
+        return
+    link = experiment_dir / "AGENTS.md"
+    if link.exists() or link.is_symlink():
+        return
+    try:
+        os.symlink(source, link)
+    except OSError:
+        shutil.copy2(source, link)
