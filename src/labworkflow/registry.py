@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import LabError, NotFoundError, StateError, UsageError
@@ -126,7 +125,7 @@ TRANSITIONS: dict[str, set[str]] = {
     "created": {"running", "success", "archived", "discarded"},
     "running": {"success", "archived", "discarded"},
     "success": {"running", "archived", "promoted", "discarded"},
-    "archived": {"promoted", "discarded", "success"},
+    "archived": {"promoted", "discarded"},
     "promoted": set(),
     "discarded": set(),
 }
@@ -158,9 +157,11 @@ def active(record: dict[str, Any]) -> bool:
 
 
 def check_editable(record: dict[str, Any]) -> None:
-    if record.get("status") in {"promoted", "discarded"}:
+    status = record.get("status")
+    if status in {"archived", "promoted", "discarded"}:
         raise StateError(
-            f"实验 {record.get('id')} 已是 {record.get('status')} 状态，不能再修改"
+            f"实验 {record.get('id')} 已结束（{str(status).upper()}），"
+            "不能再修改状态或元数据；需要继续开发请先评估是否 promote"
         )
 
 
@@ -179,11 +180,3 @@ def load_for_read(workspace: Workspace) -> list[dict[str, Any]]:
     for record in records:
         validate_record(record)
     return records
-
-
-def _readline_tail(path: Path) -> str:
-    with open(path, "rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        handle.seek(max(0, size - 4096))
-        return handle.read().decode("utf-8", "replace")

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LAB = ROOT / "bin" / "lab"
+LAB = ROOT / "bin" / "lab-workflow"
 PYTHON = sys.executable
 ID_RE = re.compile(r"实验已创建: (\d{8}-\d{3})")
 
@@ -580,6 +580,147 @@ class LabCase(unittest.TestCase):
         self.assert_ok(proc)
         self.assertTrue((self.lab_root / "AGENTS.md").is_file())
         self.assertTrue((self.lab_root / "bin").is_dir())
+
+    # ------------------------------------------------------------------
+    # try-rs integration: adopt / doctor / refresh
+    # ------------------------------------------------------------------
+    def test_adopt_registers_existing_directory(self) -> None:
+        self.init()
+        directory = self.lab_root / "active" / "2026-11-19-rust-probe"
+        directory.mkdir()
+        (directory / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (directory / "README.md").write_text(
+            "# 我自己的笔记\n\n已经跑过一版，结论见下。\n", encoding="utf-8"
+        )
+
+        proc = self.run_lab("adopt", str(directory), "--tag", "try-rs")
+        self.assert_ok(proc)
+        self.assertIn("已登记实验", proc.stdout)
+
+        record = self.records()[0]
+        self.assertEqual(record["status"], "created")
+        self.assertEqual(record["source"], "adopt")
+        self.assertEqual(record["slug"], "rust-probe")
+        self.assertEqual(record["template"], "general")
+        self.assertEqual(record["path"], "active/2026-11-19-rust-probe")
+        self.assertTrue((directory / "AGENTS.md").is_symlink())
+        self.assertTrue((directory / ".lab-meta.json").is_file())
+        self.assertIn("我自己的笔记", (directory / "README.md").read_text(encoding="utf-8"))
+
+        again = self.run_lab("adopt", str(directory))
+        self.assertEqual(again.returncode, 4, again.stderr)
+
+        outside = self.home / "outside"
+        outside.mkdir()
+        refused = self.run_lab("adopt", str(outside))
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+
+    def test_adopt_keeps_embedded_id_and_detects_node(self) -> None:
+        self.init()
+        directory = self.lab_root / "active" / "20261120-007-try-dir"
+        directory.mkdir()
+        (directory / "package.json").write_text('{"name": "x"}\n', encoding="utf-8")
+
+        proc = self.run_lab("adopt", str(directory))
+        self.assert_ok(proc)
+        record = self.records()[0]
+        self.assertEqual(record["id"], "20261120-007")
+        self.assertEqual(record["template"], "node")
+        self.assertEqual(record["slug"], "try-dir")
+
+        following = self.create("After Adopt", "--template", "general")
+        self.assertEqual(following, "20261120-008")
+
+    def test_doctor_reports_try_rs_integration(self) -> None:
+        self.init()
+        orphan = self.lab_root / "active" / "2026-11-18-orphan"
+        orphan.mkdir()
+
+        proc = self.run_lab("doctor", "--json")
+        self.assert_ok(proc)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["initialized"])
+        self.assertTrue(payload["registry_ok"])
+        self.assertIn(str(orphan.resolve()), payload["orphans"])
+        self.assertIn("try_rs", payload)
+        self.assertEqual(payload["python"], "{}.{}.{}".format(*sys.version_info[:3]))
+
+        human = self.run_lab("doctor")
+        self.assert_ok(human)
+        self.assertIn("try-rs", human.stdout)
+        self.assertIn("TUI", human.stdout)
+
+    def test_init_refresh_rewrites_managed_assets(self) -> None:
+        self.init()
+        identifier = self.create("Refresh Keep", "--template", "general")
+        agents = self.lab_root / "AGENTS.md"
+        readme = self.lab_root / "README.md"
+        template = self.lab_root / "templates" / "python" / "main.py"
+        agents.write_text("stale agents\n", encoding="utf-8")
+        readme.write_text("stale readme\n", encoding="utf-8")
+        template.write_text("stale template\n", encoding="utf-8")
+
+        proc = self.run_lab("init", "--refresh")
+        self.assert_ok(proc)
+        self.assertIn("已刷新", proc.stdout)
+        self.assertIn("lab-workflow", agents.read_text(encoding="utf-8"))
+        self.assertIn(str(self.lab_root), agents.read_text(encoding="utf-8"))
+        self.assertNotIn("stale", readme.read_text(encoding="utf-8"))
+        self.assertIn("lab-workflow", template.read_text(encoding="utf-8"))
+        self.assertEqual(self.record(identifier)["status"], "created")
+
+    # ------------------------------------------------------------------
+    # lifecycle safety
+    # ------------------------------------------------------------------
+    def test_tool_metadata_updates_do_not_block_lifecycle(self) -> None:
+        self.init()
+        identifier = self.create("Guard Clean", "--template", "general")
+        path = self.exp_path(self.record(identifier))
+
+        self.assert_ok(self.run_lab("status", identifier, "running"))
+        self.assert_ok(self.run_lab("status", identifier, "success"))
+        self.assert_ok(
+            self.run_lab("meta", identifier, "--summary", "s", "--conclusion", "c")
+        )
+
+        raw = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("README.md", raw.stdout)
+
+        self.assert_ok(self.run_lab("archive", identifier))
+        target = self.home / "workspace" / "guard-clean"
+        self.assert_ok(self.run_lab("promote", identifier, "--to", str(target)))
+        self.assertTrue((target / "README.md").is_file())
+
+        second = self.create("Guard Dirty", "--template", "general")
+        second_readme = self.exp_path(self.record(second)) / "README.md"
+        with second_readme.open("a", encoding="utf-8") as handle:
+            handle.write("\n## 用户自己的结论\n\n不要丢。\n")
+        blocked = self.run_lab("archive", second)
+        self.assertEqual(blocked.returncode, 4, blocked.stderr)
+        self.assertIn("未提交更改", blocked.stderr)
+
+    def test_archived_experiment_is_read_only(self) -> None:
+        self.init()
+        identifier = self.create("Frozen", "--template", "general")
+        self.assert_ok(self.run_lab("archive", identifier))
+
+        status = self.run_lab("status", identifier, "success")
+        self.assertEqual(status.returncode, 4, status.stderr)
+        self.assertIn("已结束", status.stderr)
+
+        meta = self.run_lab("meta", identifier, "--summary", "nope")
+        self.assertEqual(meta.returncode, 4, meta.stderr)
+        self.assertEqual(self.record(identifier)["status"], "archived")
+
+        target = self.home / "workspace" / "frozen"
+        promoted = self.run_lab("promote", identifier, "--to", str(target))
+        self.assert_ok(promoted)
+        self.assertEqual(self.record(identifier)["status"], "promoted")
 
 
 if __name__ == "__main__":

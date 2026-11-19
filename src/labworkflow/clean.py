@@ -9,7 +9,7 @@ from typing import Any
 from . import gitutil
 from .experiments import discard_experiment
 from .registry import Registry
-from .util import ACTIVE_STATUSES, age_days, compact_number, parse_timestamp, status_label
+from .util import ACTIVE_STATUSES, age_days, compact_number
 from .workspace import Workspace
 
 DEFAULT_CREATED_DAYS = 3.0

@@ -1,4 +1,8 @@
-"""Command line interface for the lab experiment workspace."""
+"""Command line interface for lab-workflow.
+
+There is deliberately no TUI here: directory browsing, previewing and
+jumping belong to try-rs. This CLI owns the registry and lifecycle.
+"""
 
 from __future__ import annotations
 
@@ -11,18 +15,16 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, clean, experiments, gitutil, search, stats
+from . import __version__, clean, doctor, experiments, gitutil, search, stats
 from .errors import LabError, StateError, UsageError
-from .registry import active, load_for_read
+from .registry import active
 from .util import (
     ALL_STATUSES,
     format_age_short,
-    format_date,
     parse_status_list,
     split_csv,
     status_label,
     table,
-    truncate,
     unique,
 )
 from .workspace import Workspace
@@ -96,6 +98,7 @@ def _format_age_days(value: float) -> str:
 # ----------------------------------------------------------------------
 def cmd_init(args, workspace: Workspace) -> int:
     created = workspace.ensure()
+    refreshed = workspace.refresh() if args.refresh else []
     print(f"工作台: {workspace.root}")
     if created:
         print("已创建/补齐:")
@@ -103,11 +106,17 @@ def cmd_init(args, workspace: Workspace) -> int:
             print(f"  + {item if item != '.' else '（根目录）'}")
     else:
         print("工作台已就绪，无需变更。")
+    if refreshed:
+        print("已刷新（覆盖工具管理的文件）:")
+        for item in refreshed:
+            print(f"  ~ {item}")
     templates = workspace.available_templates()
     print(f"模板: {', '.join(templates) if templates else '无'}")
     print("")
     print("下一步:")
     print(f"  {workspace.cli_path} new my-first-idea --template python")
+    print("  目录浏览与跳转交给 try-rs（把 tries_path 指向 ~/lab/active），")
+    print("  lab-workflow 只负责 registry、生命周期与清理。")
     return 0
 
 
@@ -155,6 +164,44 @@ def cmd_new(args, workspace: Workspace) -> int:
     print("下一步:")
     print(f"  cd {shlex.quote(str(result.path))}")
     print(f"  {workspace.cli_path} show {record.get('id')}")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# adopt
+# ----------------------------------------------------------------------
+def cmd_adopt(args, workspace: Workspace) -> int:
+    try:
+        result = experiments.adopt_experiment(
+            workspace,
+            args.path,
+            name=args.name,
+            template=args.template,
+            description=args.description or "",
+            tags=split_csv(args.tag),
+            category=args.category or "",
+            technologies=split_csv(args.technologies),
+            related_projects=split_csv(args.related_projects),
+            no_git=args.no_git,
+        )
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+
+    record = result.record
+    _warn(result.warnings)
+    if args.json:
+        _json_print(_record_json(workspace, record))
+        return 0
+
+    print(f"已登记实验: {record.get('id')}")
+    print(f"名称: {record.get('name')}")
+    print(f"路径: {result.path}")
+    print(f"模板: {result.template}（自动检测，可用 --template 覆盖）")
+    print(f"Git: {result.git_message}")
+    print("")
+    print("下一步:")
+    print(f"  {workspace.cli_path} show {record.get('id')}")
+    print(f"  用 try-rs 浏览/跳转（tries_path 指向 {workspace.active}）")
     return 0
 
 
@@ -564,6 +611,45 @@ def cmd_stats(args, workspace: Workspace) -> int:
     return 0
 
 
+def cmd_doctor(args, workspace: Workspace) -> int:
+    report = doctor.build_report(workspace)
+    if args.json:
+        _json_print(report.to_dict())
+        return 0
+
+    state = "已初始化" if report.initialized else "未初始化（运行 init）"
+    print(f"工作台: {report.root}  [{state}]")
+    registry_state = "正常" if report.registry_ok else "不可用"
+    print(f"registry: {registry_state}，共 {report.total} 个实验")
+    if report.by_status:
+        summary = " · ".join(
+            f"{status_label(status)} {count}" for status, count in report.by_status.items()
+        )
+        print(f"  {summary}")
+    print(f"Python: {report.python}")
+    print(f"Git: {report.git or '未安装'}")
+    print(f"Node/npm: {report.npm or '未安装'}")
+    if report.try_rs:
+        print(f"try-rs: {report.try_rs}（负责目录浏览/跳转）")
+    else:
+        print("try-rs: 未安装 — 目录浏览与跳转请安装 try-rs（cargo install try-rs）")
+    if report.orphans:
+        print(f"未登记目录: {len(report.orphans)} 个（可用 adopt 纳入 registry）")
+        for item in report.orphans[:10]:
+            print(f"  - {item}")
+        if len(report.orphans) > 10:
+            print(f"  … 另有 {len(report.orphans) - 10} 个")
+    if report.missing:
+        print(f"目录缺失的活跃记录: {', '.join(report.missing)}")
+    if report.dirty:
+        print(f"有未提交更改的活跃实验: {', '.join(report.dirty)}")
+    for message in report.warnings:
+        print(f"警告: {message}", file=sys.stderr)
+    print("")
+    print("定位: lab-workflow 管理 registry 与生命周期；TUI、预览与跳转由 try-rs 负责。")
+    return 0
+
+
 # ----------------------------------------------------------------------
 # search
 # ----------------------------------------------------------------------
@@ -625,14 +711,19 @@ def cmd_search(args, workspace: Workspace) -> int:
 # ----------------------------------------------------------------------
 def build_parser() -> LabParser:
     parser = LabParser(
-        prog="lab",
-        description="个人实验工作台 CLI（第一版，仓库内运行）",
-        epilog="工作台根目录固定为 ~/lab；运行 ./bin/lab init 初始化。",
+        prog="lab-workflow",
+        description="实验工作流层：registry、生命周期与清理（不提供 TUI；目录浏览交给 try-rs）",
+        epilog="工作台数据目录固定为 ~/lab；运行 ./bin/lab-workflow init 初始化。",
     )
-    parser.add_argument("--version", action="version", version=f"lab {__version__}")
+    parser.add_argument("--version", action="version", version=f"lab-workflow {__version__}")
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     p = sub.add_parser("init", help="初始化或补齐工作台骨架")
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="重写工具管理的文件（AGENTS.md/README.md/bin/README.md/templates/，会覆盖手工修改）",
+    )
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("new", help="创建实验")
@@ -648,6 +739,19 @@ def build_parser() -> LabParser:
     p.add_argument("--json", action="store_true", help="输出 JSON")
     p.set_defaults(func=cmd_new)
 
+    p = sub.add_parser("adopt", help="把已有目录（例如 try-rs 创建的）登记为实验")
+    p.add_argument("path", help="~/lab/active 下的已有目录")
+    p.add_argument("--name", help="覆盖从目录名推导的 name/slug")
+    p.add_argument("-t", "--template", help="模板（默认按目录内容检测）")
+    p.add_argument("-d", "--description", default="", help="一句话描述")
+    p.add_argument("--tag", action="append", default=[], help="标签，可重复或逗号分隔")
+    p.add_argument("--category", default="", help="分类")
+    p.add_argument("--technology", action="append", default=[], dest="technologies", help="技术栈，可重复")
+    p.add_argument("--related-project", action="append", default=[], dest="related_projects", help="相关项目，可重复")
+    p.add_argument("--no-git", action="store_true", help="不初始化 git（已有仓库保持原样）")
+    p.add_argument("--json", action="store_true", help="输出 JSON")
+    p.set_defaults(func=cmd_adopt)
+
     p = sub.add_parser("list", help="列出实验")
     p.add_argument("-a", "--all", action="store_true", help="包含归档、promote 和 discarded 墓碑")
     p.add_argument("-s", "--status", action="append", default=[], help="按状态过滤，可重复或逗号分隔")
@@ -662,9 +766,9 @@ def build_parser() -> LabParser:
     p.add_argument("--json", action="store_true", help="输出 JSON")
     p.set_defaults(func=cmd_show)
 
-    p = sub.add_parser("open", help="打印实验目录；可用 --shell 进入")
+    p = sub.add_parser("open", help="打印实验目录（交互式跳转请用 try-rs）")
     p.add_argument("ref", help="实验 ID 或名称")
-    p.add_argument("--shell", action="store_true", help="在实验目录启动子 shell")
+    p.add_argument("--shell", action="store_true", help="在实验目录启动子 shell（try-rs 未安装时的降级方案）")
     p.set_defaults(func=cmd_open)
 
     p = sub.add_parser("status", help="更新实验状态（created/running/success）")
@@ -728,6 +832,10 @@ def build_parser() -> LabParser:
     p.add_argument("--limit", type=int, default=20, help="最多结果数（默认 20；0 表示不限）")
     p.add_argument("--json", action="store_true", help="输出 JSON")
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("doctor", help="检查工作台与 try-rs 集成状态")
+    p.add_argument("--json", action="store_true", help="输出 JSON")
+    p.set_defaults(func=cmd_doctor)
 
     return parser
 

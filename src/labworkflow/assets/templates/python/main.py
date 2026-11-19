@@ -1,4 +1,4 @@
-"""{{name}} — lab experiment {{id}}.
+"""{{name}} — lab-workflow experiment {{id}}.
 
 {{description}}
 """

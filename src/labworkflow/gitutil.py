@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+from .util import strip_managed_blocks
+
 EXCLUDE_MARKER = "# lab: experiment environment and metadata"
 EXCLUDE_PATTERNS = (
     ".venv/",
@@ -104,28 +106,57 @@ def init_repo(path: Path) -> tuple[bool, str]:
     return True, "已初始化 git 仓库并提交初始版本"
 
 
-def status_lines(path: Path) -> list[str] | None:
-    """Porcelain status lines, or ``None`` when this is not a git repo."""
+def _managed_readme_only(path: Path) -> bool:
+    """True when README.md differs from HEAD only inside managed blocks."""
+
+    readme = path / "README.md"
+    if not readme.is_file():
+        return False
+    result = _run(["show", "HEAD:README.md"], path)
+    if result.returncode != 0:
+        return False
+    try:
+        working = readme.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return strip_managed_blocks(result.stdout) == strip_managed_blocks(working)
+
+
+def _is_managed_readme_line(path: Path, line: str) -> bool:
+    if len(line) < 4:
+        return False
+    if line[:2].strip() != "M":
+        return False
+    rest = line[3:]
+    if " -> " in rest:
+        return False
+    if rest.strip().strip('"') != "README.md":
+        return False
+    return _managed_readme_only(path)
+
+
+def status_lines(path: Path, *, ignore_managed: bool = True) -> list[str] | None:
+    """Porcelain status lines, or ``None`` when this is not a git repo.
+
+    By default a ``README.md`` whose only change sits inside the
+    lab-workflow managed blocks is ignored: metadata updates must not turn
+    every experiment into a dirty repository. Real user edits still count.
+    """
 
     if not is_repo(path):
         return None
     result = _run(["status", "--porcelain=v1", "--untracked-files=normal"], path)
     if result.returncode != 0:
         return None
-    return [line for line in result.stdout.splitlines() if line.strip()]
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if ignore_managed:
+        lines = [line for line in lines if not _is_managed_readme_line(path, line)]
+    return lines
 
 
 def dirty(path: Path) -> bool:
     lines = status_lines(path)
     return bool(lines)
-
-
-def dirty_summary(path: Path, *, limit: int = 5) -> str:
-    lines = status_lines(path) or []
-    shown = "; ".join(line.strip() for line in lines[:limit])
-    if len(lines) > limit:
-        shown += f"; …（共 {len(lines)} 项）"
-    return shown
 
 
 def head_commit(path: Path) -> str | None:

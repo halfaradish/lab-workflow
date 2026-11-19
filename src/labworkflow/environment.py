@@ -90,7 +90,7 @@ def _python_has_pip(python: Path) -> bool:
 
 
 def _cached_get_pip(outcome: EnvOutcome) -> Path | None:
-    cache_dir = Path.home() / ".cache" / "lab"
+    cache_dir = Path.home() / ".cache" / "lab-workflow"
     script = cache_dir / "get-pip.py"
     if script.is_file() and script.stat().st_size > 10_000:
         return script
@@ -98,7 +98,7 @@ def _cached_get_pip(outcome: EnvOutcome) -> Path | None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(
         GET_PIP_URL,
-        headers={"User-Agent": "lab-cli/0.1 (+https://bootstrap.pypa.io/get-pip.py)"},
+        headers={"User-Agent": "lab-workflow/0.2 (+https://bootstrap.pypa.io/get-pip.py)"},
     )
     try:
         with urllib.request.urlopen(request, timeout=GET_PIP_TIMEOUT) as response:

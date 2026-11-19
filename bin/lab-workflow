@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Repo-local entry point for the lab CLI.
+"""Repo-local entry point for lab-workflow.
 
-The first version is intentionally not installed into PATH. Run this
-script from the repository: ``./bin/lab ...``.
+lab-workflow is deliberately not installed into PATH in this version. Run
+it from the repository: ``./bin/lab-workflow ...``.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
-from labctl.cli import main  # noqa: E402
+from labworkflow.cli import main  # noqa: E402
 
 if __name__ == "__main__":
     sys.exit(main())

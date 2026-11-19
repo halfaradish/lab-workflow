@@ -27,7 +27,7 @@
 source .venv/bin/activate
 python main.py
 ```
-环境由 lab 创建在实验目录内，不要修改全局依赖。
+环境由 lab-workflow 创建在实验目录内，不要修改全局依赖。
 -->
 
 ## 结果与观察
@@ -42,4 +42,4 @@ python main.py
 
 ## 下一步
 
-<!-- 继续、归档（lab archive）还是 promote？ -->
+<!-- 继续、归档（lab-workflow archive）还是 promote？ -->

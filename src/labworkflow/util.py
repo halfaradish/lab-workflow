@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -22,13 +22,29 @@ STATUS_LABELS = {
 
 ALL_STATUSES = tuple(STATUS_LABELS)
 ACTIVE_STATUSES = ("created", "running", "success")
-TERMINAL_STATUSES = ("promoted", "discarded")
 
 TEMPLATE_TECHNOLOGIES = {
     "python": ["Python"],
     "node": ["Node.js"],
     "general": [],
 }
+
+MANAGED_BLOCK_RE = re.compile(
+    r"<!--\s*lab:(?P<name>[A-Za-z0-9_-]+):start\s*-->"
+    r".*?"
+    r"<!--\s*lab:(?P=name):end\s*-->",
+    re.DOTALL,
+)
+
+
+def strip_managed_blocks(text: str) -> str:
+    """Drop README sections owned by lab-workflow.
+
+    Used to tell apart tool-generated metadata churn from real user edits
+    when checking a repository for uncommitted work.
+    """
+
+    return MANAGED_BLOCK_RE.sub("", text)
 
 
 def now_local() -> datetime:
@@ -290,15 +306,3 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 def atomic_write_json(path: Path, value: Any, *, indent: int = 2) -> None:
     atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=indent) + "\n")
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def iso_days_ago(days: float, *, now: datetime | None = None) -> str:
-    return ((now or now_local()) - timedelta(days=days)).isoformat()
-
-
-def plural_count(count: int, singular: str, plural: str | None = None) -> str:
-    return f"{count} {singular if count == 1 else (plural or singular + 's')}"

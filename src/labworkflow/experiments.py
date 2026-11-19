@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +53,15 @@ class CreateResult:
     record: dict[str, Any]
     path: Path
     env: EnvOutcome = field(default_factory=EnvOutcome)
+    git_message: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AdoptResult:
+    record: dict[str, Any]
+    path: Path
+    template: str
     git_message: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -249,6 +257,14 @@ def _default_technologies(template: str, provided: list[str]) -> list[str]:
     return result
 
 
+def _template_label(template: str) -> str:
+    return {
+        "python": "Python",
+        "node": "Node.js",
+        "general": "通用",
+    }.get(template, template)
+
+
 def create_experiment(
     workspace: Workspace,
     name: str,
@@ -289,11 +305,7 @@ def create_experiment(
         if not template_dir.is_dir():
             raise UsageError(f"模板目录不存在: {template_dir}")
 
-        display_template = {
-            "python": "Python",
-            "node": "Node.js",
-            "general": "通用",
-        }.get(template, template)
+        display_template = _template_label(template)
         mapping = {
             "id": identifier,
             "name": display_name,
@@ -357,6 +369,213 @@ def create_experiment(
         except Exception:
             if created_dir is not None and created_dir.exists():
                 shutil.rmtree(created_dir, ignore_errors=True)
+            raise
+    return result
+
+
+# ----------------------------------------------------------------------
+# Adopt existing directories (typically created by try-rs)
+# ----------------------------------------------------------------------
+_EXTERNAL_DATE_PATTERNS = (
+    (re.compile(r"^(\d{8})-(\d{1,3})-(.+)$"), True),
+    (re.compile(r"^(\d{4}-\d{2}-\d{2})[-_](.+)$"), False),
+    (re.compile(r"^(\d{8})[-_](.+)$"), False),
+)
+
+
+def split_external_name(basename: str) -> tuple[str, str | None]:
+    """Split a try-rs style folder name into ``(display name, embedded id)``.
+
+    ``20261120-001-api-test`` keeps its id; ``2026-11-20-rust-test`` and
+    ``rust-test`` only supply a name. Undated names are used as-is.
+    """
+
+    for pattern, embeds_id in _EXTERNAL_DATE_PATTERNS:
+        match = pattern.match(basename)
+        if not match:
+            continue
+        if embeds_id:
+            return match.group(3), f"{match.group(1)}-{int(match.group(2)):03d}"
+        return match.group(2), None
+    return basename, None
+
+
+def detect_template(path: Path) -> str:
+    """Best-effort template detection for a directory created elsewhere."""
+
+    if (path / "package.json").is_file():
+        return "node"
+    python_markers = ("requirements.txt", "pyproject.toml", "setup.py", "Pipfile")
+    if any((path / marker).is_file() for marker in python_markers):
+        return "python"
+    suffixes: set[str] = set()
+    try:
+        for entry in path.iterdir():
+            if entry.is_file() and entry.suffix:
+                suffixes.add(entry.suffix.lower())
+    except OSError:
+        return "general"
+    if ".py" in suffixes:
+        return "python"
+    if suffixes & {".js", ".mjs", ".cjs", ".ts"}:
+        return "node"
+    return "general"
+
+
+def _detect_env(path: Path, template: str) -> dict[str, Any] | None:
+    if template == "python" and (path / ".venv" / "bin" / "python").exists():
+        return {
+            "type": "python",
+            "path": ".venv",
+            "ok": True,
+            "pip": (path / ".venv" / "bin" / "pip").exists(),
+        }
+    if template == "node" and (path / "node_modules").is_dir():
+        return {"type": "node", "path": "node_modules", "ok": True}
+    return None
+
+
+def _resolve_adopt_path(workspace: Workspace, raw: str) -> Path:
+    candidate = Path(raw).expanduser()
+    options = (
+        [candidate]
+        if candidate.is_absolute()
+        else [Path.cwd() / candidate, workspace.active / candidate]
+    )
+    for option in options:
+        if option.is_dir():
+            return option.resolve()
+    raise NotFoundError(f"要 adopt 的目录不存在: {raw}")
+
+
+def adopt_experiment(
+    workspace: Workspace,
+    raw_path: str,
+    *,
+    name: str | None = None,
+    template: str | None = None,
+    description: str = "",
+    tags: list[str] | None = None,
+    category: str = "",
+    technologies: list[str] | None = None,
+    related_projects: list[str] | None = None,
+    no_git: bool = False,
+) -> AdoptResult:
+    """Register an existing directory without moving or rewriting its code.
+
+    This is the bridge from try-rs: try-rs owns browsing/creation, while
+    lab-workflow adds metadata, lifecycle and clean-up. Adoption never
+    deletes user files and never overwrites an existing README.
+    """
+
+    path = _resolve_adopt_path(workspace, raw_path)
+    active_root = workspace.active.resolve()
+    if path == active_root or not path.is_relative_to(active_root):
+        raise UsageError(
+            f"adopt 只接受 ~/lab/active 下的目录: {path}\n"
+            "可以先把目录移入 active/，或用 lab-workflow new 重新创建。"
+        )
+
+    result = AdoptResult(record={}, path=path, template="")
+    with workspace.lock():
+        registry = Registry(workspace)
+        records = registry.load()
+        known = {
+            candidate.resolve()
+            for candidate in (record_path(workspace, record) for record in records)
+            if candidate is not None
+        }
+        if path in known:
+            raise StateError(f"目录已经登记在 registry 中: {path}")
+
+        derived_name, embedded_id = split_external_name(path.name)
+        slug = slugify(name or derived_name)
+        _unique_slug(records, slug)
+        identifier = embedded_id or registry.next_id(records)
+        if any(str(record.get("id")) == identifier for record in records):
+            raise StateError(f"实验 ID 已存在: {identifier}")
+
+        chosen_template = template or detect_template(path)
+        if not workspace.template_path(chosen_template).is_dir():
+            available = ", ".join(workspace.available_templates()) or "无"
+            raise UsageError(f"未知模板 '{chosen_template}'；可用模板: {available}")
+
+        created_at = now_iso()
+        record: dict[str, Any] = {
+            "id": identifier,
+            "name": name or derived_name,
+            "slug": slug,
+            "path": workspace.relative(path),
+            "status": "created",
+            "template": chosen_template,
+            "template_label": _template_label(chosen_template),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "status_changed_at": created_at,
+            "description": description.strip(),
+            "tags": unique(str(tag).strip() for tag in (tags or []) if str(tag).strip()),
+            "category": category.strip(),
+            "summary": "",
+            "conclusion": "",
+            "technologies": _default_technologies(chosen_template, technologies or []),
+            "related_projects": unique(
+                str(item).strip() for item in (related_projects or []) if str(item).strip()
+            ),
+            "git": False,
+            "env": _detect_env(path, chosen_template),
+            "source": "adopt",
+            "adopted_at": created_at,
+        }
+        result.template = chosen_template
+        before = {entry.name for entry in path.iterdir()}
+        try:
+            readme = path / "README.md"
+            if not readme.exists():
+                atomic_write_text(readme, render_readme(workspace, record))
+            else:
+                try:
+                    text = readme.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                if "<!-- lab:metadata:start -->" not in text:
+                    result.warnings.append(
+                        "README 已存在但没有 lab-workflow 标记块，元数据不会同步进 README"
+                    )
+            ensure_agents_link(workspace, path)
+
+            if no_git:
+                existing = gitutil.is_repo(path)
+                record["git"] = existing
+                result.git_message = (
+                    "沿用已有 git 仓库（--no-git）" if existing else "已跳过版本控制（--no-git）"
+                )
+            elif gitutil.is_repo(path):
+                gitutil.write_excludes(path)
+                record["git"] = True
+                result.git_message = "沿用已有 git 仓库（未提交）"
+                dirty = gitutil.status_lines(path) or []
+                if dirty:
+                    result.warnings.append(
+                        f"目录有 {len(dirty)} 项未提交更改，已原样保留"
+                    )
+            else:
+                ok, message = gitutil.init_repo(path)
+                record["git"] = bool(ok)
+                result.git_message = message
+
+            registry.write_record(record)
+            result.record = record
+            result.warnings.extend(_sync_all(workspace, record))
+        except Exception:
+            for cleanup_name in (META_FILENAME, "README.md", "AGENTS.md"):
+                if cleanup_name in before:
+                    continue
+                try:
+                    leftover = path / cleanup_name
+                    if leftover.is_symlink() or leftover.is_file():
+                        leftover.unlink()
+                except OSError:
+                    pass
             raise
     return result
 
@@ -455,6 +674,8 @@ def show_text(workspace: Workspace, record: dict[str, Any]) -> str:
         if record.get("env_skipped")
         else f"环境: {environment.environment_summary(record.get('env'))}"
     )
+    if record.get("adopted_at"):
+        lines.append(f"登记于: {format_date(record.get('adopted_at'))}（adopt）")
     if record.get("archived_at"):
         lines.append(f"归档于: {format_date(record.get('archived_at'))}")
     if record.get("promoted_at"):

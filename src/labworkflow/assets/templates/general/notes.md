@@ -13,4 +13,4 @@
 
 ## 待整理
 
-<!-- 结束后把结论整理进 README，并用 lab meta 同步。 -->
+<!-- 结束后把结论整理进 README，并用 lab-workflow meta 同步。 -->
