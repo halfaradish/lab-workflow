@@ -134,4 +134,4 @@ try-rs
 - 没有 unarchive 命令；归档后不能再改状态/元数据，如需继续先评估 promote。
 - `promote` 只复制文件，不自动 `git init`，也不替用户决定仓库结构。
 
-工作台初始化时间：`{{generated_at}}`。
+本文档最近同步时间：`{{generated_at}}`（`init --refresh` 会更新）。
