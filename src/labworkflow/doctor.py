@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import gitutil
+from . import compat, gitutil
 from .errors import LabError
 from .registry import load_for_read
 from .util import ACTIVE_STATUSES, ALL_STATUSES
@@ -22,11 +22,11 @@ def _first_line(command: str, *args: str, timeout: int = 5) -> str | None:
         return None
     try:
         proc = subprocess.run(
-            [executable, *args],
+            compat.executable_command(executable, *args),
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
+            **compat.text_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

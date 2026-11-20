@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import compat
+
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 GET_PIP_TIMEOUT = 90
 
@@ -37,9 +39,9 @@ def _run(
         args,
         cwd=str(cwd),
         capture_output=True,
-        text=True,
         timeout=timeout,
         env=env,
+        **compat.text_subprocess_kwargs(),
     )
 
 
@@ -81,8 +83,8 @@ def _python_has_pip(python: Path) -> bool:
         result = subprocess.run(
             [str(python), "-m", "pip", "--version"],
             capture_output=True,
-            text=True,
             timeout=20,
+            **compat.text_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -90,7 +92,7 @@ def _python_has_pip(python: Path) -> bool:
 
 
 def _cached_get_pip(outcome: EnvOutcome) -> Path | None:
-    cache_dir = Path.home() / ".cache" / "lab-workflow"
+    cache_dir = compat.cache_dir()
     script = cache_dir / "get-pip.py"
     if script.is_file() and script.stat().st_size > 10_000:
         return script
@@ -106,7 +108,7 @@ def _cached_get_pip(outcome: EnvOutcome) -> Path | None:
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         outcome.warnings.append(
             f"无法下载 get-pip.py（{exc}）。venv 已创建但没有 pip；"
-            f"可稍后下载 {GET_PIP_URL} 到本地，再执行 `.venv/bin/python <文件路径>` 安装"
+            f"可稍后下载 {GET_PIP_URL} 到本地，再执行 `{compat.venv_python_rel()} <文件路径>` 安装"
         )
         return None
     if len(data) > 10_000_000:
@@ -119,7 +121,7 @@ def _cached_get_pip(outcome: EnvOutcome) -> Path | None:
 
 
 def _bootstrap_pip(venv: Path, outcome: EnvOutcome) -> bool:
-    python = venv / "bin" / "python"
+    python = compat.venv_python(venv)
     if _python_has_pip(python):
         return True
     script = _cached_get_pip(outcome)
@@ -144,6 +146,7 @@ def _bootstrap_pip(venv: Path, outcome: EnvOutcome) -> bool:
 
 def _setup_python(experiment_dir: Path, outcome: EnvOutcome) -> dict:
     venv = experiment_dir / ".venv"
+    python = compat.venv_python(venv)
     record = {"type": "python", "path": ".venv", "ok": False, "pip": False}
     try:
         result = _run([sys.executable, "-m", "venv", str(venv)], experiment_dir, timeout=180)
@@ -151,10 +154,10 @@ def _setup_python(experiment_dir: Path, outcome: EnvOutcome) -> dict:
         outcome.warnings.append(f"创建 venv 失败：{exc}")
         return record
 
-    if result.returncode != 0 or not (venv / "bin" / "python").exists():
+    if result.returncode != 0 or not python.exists():
         detail = _tail(result.stderr)
         if venv.exists():
-            shutil.rmtree(venv, ignore_errors=True)
+            compat.safe_rmtree(venv, ignore_errors=True)
         outcome.messages.append(
             "完整 venv 创建失败（宿主机缺少 ensurepip），改用 --without-pip 重试"
         )
@@ -167,12 +170,12 @@ def _setup_python(experiment_dir: Path, outcome: EnvOutcome) -> dict:
         except (OSError, subprocess.TimeoutExpired) as exc:
             outcome.warnings.append(f"创建 venv 失败：{exc}")
             return record
-        if result.returncode != 0 or not (venv / "bin" / "python").exists():
+        if result.returncode != 0 or not python.exists():
             outcome.warnings.append(
                 f"创建 venv 失败：{_tail(result.stderr) or detail or '未知错误'}"
             )
             if venv.exists():
-                shutil.rmtree(venv, ignore_errors=True)
+                compat.safe_rmtree(venv, ignore_errors=True)
             return record
 
     record["ok"] = True
@@ -198,7 +201,9 @@ def _setup_node(experiment_dir: Path, outcome: EnvOutcome) -> dict:
     outcome.messages.append("正在安装本地依赖（npm install）…")
     try:
         result = _run(
-            [npm, "install", "--no-audit", "--no-fund", "--loglevel=error"],
+            compat.executable_command(
+                npm, "install", "--no-audit", "--no-fund", "--loglevel=error"
+            ),
             experiment_dir,
             timeout=600,
             env=env,

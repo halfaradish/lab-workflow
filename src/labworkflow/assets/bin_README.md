@@ -6,14 +6,13 @@
 这样可以确保：
 
 - 命令始终对应仓库里的那一份代码；
-- 不会因为 `~/lab/bin` 出现在 PATH 中而误用旧版本；
+- 不会因为 `{{workspace_root}}/bin` 出现在 PATH 中而误用旧版本；
 - 工作台数据与工具实现保持清晰分离。
 
-在仓库内使用：
+在仓库内使用（Windows 下是 `bin\lab-workflow.cmd`）：
 
-```bash
-cd /path/to/lab-workflow
-./bin/lab-workflow --help
+```text
+{{lab_cmd}} --help
 ```
 
 如果以后需要全局安装，应单独评审安装方式、版本升级和数据兼容性。

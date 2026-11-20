@@ -23,10 +23,14 @@
 ## 运行方式
 
 <!-- 在这里写实际可复现的命令。例如：
-```bash
+# POSIX
 source .venv/bin/activate
 python main.py
-```
+
+# Windows
+.venv\Scripts\activate
+python main.py
+
 环境由 lab-workflow 创建在实验目录内，不要修改全局依赖。
 -->
 

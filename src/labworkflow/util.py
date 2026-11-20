@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import compat
+
 STATUS_LABELS = {
     "created": "CREATED",
     "running": "RUNNING",
@@ -174,6 +176,7 @@ def slugify(raw: str) -> str:
         )
     if len(slug) > 48:
         raise ValueError("实验名称过长（最多 48 个字符）")
+    compat.validate_portable_slug(slug)
     return slug
 
 
@@ -277,7 +280,7 @@ def atomic_write_text(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        compat.atomic_replace(tmp_path, path)
     finally:
         if tmp_path.exists():
             try:
@@ -295,7 +298,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        compat.atomic_replace(tmp_path, path)
     finally:
         if tmp_path.exists():
             try:

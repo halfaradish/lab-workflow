@@ -1,19 +1,18 @@
 # 我的实验工作台
 
-这是 `lab-workflow` 管理的个人实验工作台，数据根目录固定为 `{{workspace_root}}`。
+这是 `lab-workflow` 管理的个人实验工作台，数据根目录为 `{{workspace_root}}`。
 
 `lab-workflow` 是**registry 与生命周期层**：创建/登记实验、记录结论、归档、
 promote、按策略清理。它**不提供 TUI**——目录浏览、预览、模糊搜索和跳转交给
 [try-rs](https://github.com/tassiovirginio/try-rs)。
 
-`lab-workflow` 第一版**不安装到全局 PATH**，只在工具仓库目录内使用：
+`lab-workflow` **不安装到全局 PATH**，直接在工具仓库内使用：
 
-```bash
-cd /path/to/lab-workflow
-./bin/lab-workflow list
+```text
+{{lab_cmd}} list
 ```
 
-本工作台内的命令路径为 `{{lab_cmd}}`。
+本工作台内的命令路径为 `{{lab_cmd}}`（Windows 下是 `bin\lab-workflow.cmd`）。
 
 ## 与 try-rs 的分工
 
@@ -41,6 +40,8 @@ cd /path/to/lab-workflow
 {{lab_cmd}} show my-first-idea
 cd "$({{lab_cmd}} open my-first-idea)"
 
+# Windows: 先运行 {{lab_cmd}} open my-first-idea，再 cd 到输出路径
+
 # 用 try-rs 浏览/跳转（先配置 tries_path）
 try-rs
 
@@ -60,14 +61,16 @@ try-rs
 ├── templates/             # python / node / general 模板
 ├── registry/
 │   └── experiments.jsonl  # 元数据，registry 是权威来源
-└── bin/                   # 预留；第一版为空
+├── bin/                   # 预留；第一版为空
+├── .agent/skills/lab-management/   # 权威 skill 副本
+└── .agents/skills/lab-management/  # ZCode 等通用发现路径的兼容副本
 ```
 
 每个实验目录包含：
 
 - `README.md`：结构化实验记录（假设、方法、结果、结论）
 - `.lab-meta.json`：registry 的本地镜像（已被 git 忽略）
-- `AGENTS.md`：指向工作台 `AGENTS.md` 的符号链接
+- `AGENTS.md`：指向工作台 `AGENTS.md` 的符号链接（不支持符号链接时退化为受管副本）
 - 按模板生成的代码骨架和隔离环境
 
 ## 实验生命周期

@@ -15,7 +15,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from . import __version__, clean, doctor, experiments, gitutil, search, stats
+from . import __version__, clean, compat, doctor, experiments, gitutil, search, stats
 from .errors import LabError, StateError, UsageError
 from .registry import active
 from .util import (
@@ -27,7 +27,7 @@ from .util import (
     table,
     unique,
 )
-from .workspace import Workspace
+from .workspace import Workspace, resolve_root
 
 
 class LabParser(argparse.ArgumentParser):
@@ -51,16 +51,17 @@ def _warn(messages: list[str]) -> None:
 def _require_workspace(workspace: Workspace) -> None:
     if not workspace.root.is_dir():
         raise LabError(
-            f"工作台不存在: {workspace.root}\n先运行: {workspace.cli_path} init"
+            f"工作台不存在: {workspace.root}\n先运行: {workspace.command_hint('init')}"
         )
     if not (workspace.active.is_dir() and workspace.registry_dir.is_dir()):
         raise LabError(
-            f"工作台结构不完整: {workspace.root}\n运行 {workspace.cli_path} init 补齐骨架"
+            f"工作台结构不完整: {workspace.root}\n"
+            f"运行 {workspace.command_hint('init')} 补齐骨架"
         )
     if not workspace.registry_path.is_file():
         raise LabError(
             f"registry 文件缺失: {workspace.registry_path}\n"
-            f"运行 {workspace.cli_path} init 重新创建"
+            f"运行 {workspace.command_hint('init')} 重新创建"
         )
 
 
@@ -114,8 +115,8 @@ def cmd_init(args, workspace: Workspace) -> int:
     print(f"模板: {', '.join(templates) if templates else '无'}")
     print("")
     print("下一步:")
-    print(f"  {workspace.cli_path} new my-first-idea --template python")
-    print("  目录浏览与跳转交给 try-rs（把 tries_path 指向 ~/lab/active），")
+    print(f"  {workspace.command_hint('new my-first-idea --template python')}")
+    print(f"  目录浏览与跳转交给 try-rs（把 tries_path 指向 {workspace.active}），")
     print("  lab-workflow 只负责 registry、生命周期与清理。")
     return 0
 
@@ -163,7 +164,7 @@ def cmd_new(args, workspace: Workspace) -> int:
     print("")
     print("下一步:")
     print(f"  cd {shlex.quote(str(result.path))}")
-    print(f"  {workspace.cli_path} show {record.get('id')}")
+    print(f"  {workspace.command_hint('show ' + str(record.get('id')))}")
     return 0
 
 
@@ -200,7 +201,7 @@ def cmd_adopt(args, workspace: Workspace) -> int:
     print(f"Git: {result.git_message}")
     print("")
     print("下一步:")
-    print(f"  {workspace.cli_path} show {record.get('id')}")
+    print(f"  {workspace.command_hint('show ' + str(record.get('id')))}")
     print(f"  用 try-rs 浏览/跳转（tries_path 指向 {workspace.active}）")
     return 0
 
@@ -231,7 +232,7 @@ def cmd_list(args, workspace: Workspace) -> int:
         if total == 0:
             print("没有匹配的实验。")
             if not args.all and not statuses and not args.tag:
-                print(f"新建一个: {workspace.cli_path} new my-first-idea --template python")
+                print(f"新建一个: {workspace.command_hint('new my-first-idea --template python')}")
         else:
             print("没有匹配的实验。")
         return 0
@@ -299,11 +300,11 @@ def cmd_open(args, workspace: Workspace) -> int:
         raise StateError(f"实验目录不存在（状态 {status_label(record.get('status', ''))}）")
     print(path)
     if args.shell:
-        shell = os.environ.get("SHELL") or "/bin/sh"
-        if not Path(shell).exists():
-            raise LabError(f"找不到 shell: {shell}")
+        command = compat.interactive_shell()
+        if not compat.is_windows() and not Path(command[0]).exists():
+            raise LabError(f"找不到 shell: {command[0]}")
         try:
-            return subprocess.call([shell], cwd=str(path))
+            return subprocess.call(command, cwd=str(path))
         except OSError as exc:
             raise LabError(f"启动 shell 失败: {exc}") from exc
     return 0
@@ -571,7 +572,7 @@ def cmd_stats(args, workspace: Workspace) -> int:
         return 0
     print(f"实验总数: {report.total}")
     if report.total == 0:
-        print(f"还没有实验。新建一个: {workspace.cli_path} new my-first-idea")
+        print(f"还没有实验。新建一个: {workspace.command_hint('new my-first-idea')}")
         return 0
     active_count = sum(report.by_status.get(status, 0) for status in ("created", "running", "success"))
     print(f"活跃实验: {active_count}")
@@ -713,16 +714,29 @@ def build_parser() -> LabParser:
     parser = LabParser(
         prog="lab-workflow",
         description="实验工作流层：registry、生命周期与清理（不提供 TUI；目录浏览交给 try-rs）",
-        epilog="工作台数据目录固定为 ~/lab；运行 ./bin/lab-workflow init 初始化。",
+        epilog=(
+            "工作台根目录默认 ~/lab；也可用 --root 指定，或运行 init <目录>。"
+            "进入工作台后命令会自动发现根目录。"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"lab-workflow {__version__}")
+    parser.add_argument(
+        "--root",
+        metavar="PATH",
+        help="工作台根目录（默认 ~/lab；也可用 LAB_WORKFLOW_ROOT 或从当前目录发现）",
+    )
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     p = sub.add_parser("init", help="初始化或补齐工作台骨架")
     p.add_argument(
+        "path",
+        nargs="?",
+        help="工作台目录（默认 ~/lab 或从当前目录发现；也可用全局 --root）",
+    )
+    p.add_argument(
         "--refresh",
         action="store_true",
-        help="重写工具管理的文件（AGENTS.md/README.md/bin/README.md/templates/，会覆盖手工修改）",
+        help="重写工具管理的文件（AGENTS.md/README.md/bin/README.md/templates/、skill，会覆盖手工修改）",
     )
     p.set_defaults(func=cmd_init)
 
@@ -740,7 +754,7 @@ def build_parser() -> LabParser:
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("adopt", help="把已有目录（例如 try-rs 创建的）登记为实验")
-    p.add_argument("path", help="~/lab/active 下的已有目录")
+    p.add_argument("path", help="工作台 active/ 下的已有目录")
     p.add_argument("--name", help="覆盖从目录名推导的 name/slug")
     p.add_argument("-t", "--template", help="模板（默认按目录内容检测）")
     p.add_argument("-d", "--description", default="", help="一句话描述")
@@ -840,11 +854,36 @@ def build_parser() -> LabParser:
     return parser
 
 
+def _configure_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
+def _cli_root(args) -> str | None:
+    root = args.root
+    init_path = getattr(args, "path", None) if args.command == "init" else None
+    if init_path:
+        if root:
+            explicit = Path(root).expanduser().resolve()
+            target = Path(init_path).expanduser().resolve()
+            if explicit != target:
+                raise UsageError("--root 与 init PATH 指向不同目录，请只保留一个")
+        root = init_path
+    return root
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_output()
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        workspace = Workspace()
+        workspace = Workspace(root=resolve_root(_cli_root(args)))
         if args.command == "init":
             return args.func(args, workspace)
         _require_workspace(workspace)

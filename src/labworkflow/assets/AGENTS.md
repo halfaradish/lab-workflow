@@ -1,3 +1,4 @@
+<!-- lab:workspace-agents -->
 # AGENTS.md — lab-workflow 工作台规则
 
 本目录是个人实验工作台，根目录为 `{{workspace_root}}`。
@@ -29,18 +30,20 @@ promote、清理。它**不提供 TUI**。
 
 ## 命令
 
-第一版 `lab-workflow` 只在工具仓库内可用：
+`lab-workflow` 只在工具仓库内可用，不假设它在全局 PATH 中：
 
-```bash
-cd /path/to/lab-workflow
-./bin/lab-workflow list
-./bin/lab-workflow new my-idea --template python
+```text
+{{lab_cmd}} list
+{{lab_cmd}} new my-idea --template python
 ```
 
-本文档中的命令路径为 `{{lab_cmd}}`。不要假设 `lab-workflow` 已在全局 PATH 中。
+本文档中的命令路径为 `{{lab_cmd}}`（Windows 下是 `bin\lab-workflow.cmd`）。
 
 常用命令：`init`、`new`、`adopt`、`list`、`show`、`open`、`status`、`meta`、
 `archive`、`promote`、`discard`、`clean`、`stats`、`search`、`doctor`。
+
+工作台自带 `lab-management` skill（`.agent/skills/lab-management/`）。做实验时优先
+按该 skill 的流程执行：先写目标契约，用最小实现验证，再总结和归档。
 
 ## 与 try-rs 的分工
 

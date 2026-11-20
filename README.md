@@ -19,8 +19,18 @@ archive / promote / clean / discard
 
 ## 定位与非目标
 
-工作台数据仍然放在 `~/lab`。工具与数据目录解耦：工具叫 `lab-workflow`，数据目录
-保持 `~/lab`，已有工作台无需迁移。
+工作台数据默认放在 `~/lab`，但不再是硬编码：`init <目录>` 可以把任意目录变成
+工作台。工具与数据目录解耦；已有 `~/lab` 工作台无需迁移。
+
+```bash
+./bin/lab-workflow init /data/lab          # 指定目录初始化
+./bin/lab-workflow --root /data/lab list   # 显式指定根目录
+cd /data/lab && /path/to/lab-workflow list # 从工作台内部自动发现
+LAB_WORKFLOW_ROOT=/data/lab ./bin/lab-workflow list
+```
+
+优先级：`--root` > `init PATH` > `LAB_WORKFLOW_ROOT` > 当前目录向上发现 > `~/lab`。
+`--root` 是全局参数，必须放在子命令前。
 
 **做：**
 
@@ -58,7 +68,8 @@ Rust 单二进制、TUI、模糊过滤、预览、多根目录、编辑器/shell
 | Agent 规范 | ❌ | ✅ `AGENTS.md` 注入 |
 | 历史检索 | 仅目录名 | ✅ 元数据 + README 全文 |
 
-**推荐配置**：让 try-rs 只管理 `~/lab/active`，不要指向工作台根目录。
+**推荐配置**：让 try-rs 只管理工作台的 `active/`，不要指向工作台根目录。
+如果使用自定义根目录，把下面的路径替换成 `<workspace>/active`。
 
 ```toml
 # ~/.config/try-rs/config.toml
@@ -89,7 +100,8 @@ cd ~/project/lab-workflow
 `adopt` 会分配 ID、生成缺失的 README、建立 AGENTS 链接、检测模板与已有环境、
 初始化 Git（已有仓库则沿用），并写入 registry。名字里的 `20261120-001-` 或
 `2026-11-20-` 前缀会被识别。目录里的文件原样保留，`created_at` / `adopted_at`
-记录登记时间（不伪造历史创建时间）。
+记录登记时间（不伪造历史创建时间）。如果工作台不是 `~/lab`，把示例里的路径换成
+`<workspace>/active`，并给命令加 `--root <workspace>`。
 
 ### 两条边界
 
@@ -104,7 +116,8 @@ cd ~/project/lab-workflow
 
 ```bash
 cd ~/project/lab-workflow
-./bin/lab-workflow init
+./bin/lab-workflow init              # 默认工作台 ~/lab
+# 或：./bin/lab-workflow init /data/lab
 
 # 创建 Python 实验（默认初始化 Git 和实验内 .venv）
 ./bin/lab-workflow new websocket-test --template python --tag network,perf \
@@ -125,12 +138,29 @@ cd "$(./bin/lab-workflow open websocket-test)"
 # ./bin/lab-workflow promote websocket-test --to ~/workspace/websocket-test
 ```
 
+`init` 还会把 `lab-management` skill 安装到工作台的 `.agent/skills/` 和
+`.agents/skills/`。后者是 ZCode 等运行时的通用发现路径；`init --refresh` 会同时更新
+两份。skill 里预留了工作台根目录和 CLI 路径，安装时按当前机器渲染。
+
+### Windows
+
+```bat
+cd C:\path\to\lab-workflow
+bin\lab-workflow.cmd init
+bin\lab-workflow.cmd init D:\lab
+bin\lab-workflow.cmd new websocket-test --template python
+```
+
+`bin\lab-workflow.cmd` 会优先使用 `py -3`，否则使用 `python`。实验内 Python 环境在
+`.venv\Scripts\`；`AGENTS.md` 在不支持符号链接的文件系统上会退化为受管副本。
+建议开启 Windows 长路径支持（实验路径 + `.venv` 可能超过 260 字符）。
+
 `new` 默认会：
 
 1. 分配 `YYYYMMDD-NNN` 全局唯一 ID；
 2. 在 `active/` 下创建 `YYYYMMDD-NNN-kebab-name/`；
 3. 渲染模板，生成结构化 `README.md` 和 `.lab-meta.json`；
-4. 创建指向 `~/lab/AGENTS.md` 的 `AGENTS.md` 符号链接；
+4. 创建指向 `<workspace>/AGENTS.md` 的 `AGENTS.md` 符号链接（Windows 上退化为受管副本）；
 5. 初始化 Git 并提交初始快照；
 6. 按模板创建实验内 Python `.venv` 或 Node `node_modules`；
 7. 写入 `registry/experiments.jsonl`。
@@ -139,7 +169,7 @@ cd "$(./bin/lab-workflow open websocket-test)"
 
 | 命令 | 作用 |
 | --- | --- |
-| `lab-workflow init` | 初始化或补齐 `~/lab` 骨架；`--refresh` 重写工具管理的文件 |
+| `lab-workflow init [PATH]` | 初始化任意目录为工作台（默认 `~/lab`）；`--refresh` 重写工具管理的文件和 skill |
 | `lab-workflow new <name>` | 创建实验，支持 `--template`、`--tag`、`--description`、`--no-git`、`--no-env` |
 | `lab-workflow adopt <path>` | 把 `active/` 下已有目录登记为实验（不移动、不覆盖） |
 | `lab-workflow list` | 列出活跃实验；`--all` 含归档/promote/丢弃墓碑；支持状态、标签、模板过滤 |
@@ -209,8 +239,10 @@ discarded_at, discarded_reason, discarded_from_status
 ## 环境隔离
 
 - **Python**：实验内 `.venv/`。宿主机缺 `ensurepip` 时先用 `--without-pip`，
-  再从 `https://bootstrap.pypa.io/get-pip.py` 下载到
-  `~/.cache/lab-workflow/get-pip.py`，只在实验 venv 内安装 pip。网络失败只警告。
+  再从 `https://bootstrap.pypa.io/get-pip.py` 下载到缓存目录
+  （Linux: `$XDG_CACHE_HOME/lab-workflow` 或 `~/.cache/lab-workflow`；
+  Windows: `%LOCALAPPDATA%\lab-workflow`），只在实验 venv 内安装 pip。网络失败只警告。
+  Windows 的解释器在 `.venv\Scripts\python.exe`。
 - **Node**：实验内 `npm install`，依赖进入 `node_modules/`，不使用 `npm -g`。
 - **general**：不创建语言环境。
 - `--no-env` / `--no-git` 可跳过；`adopt` 不创建环境，只检测已有环境。
@@ -218,7 +250,7 @@ discarded_at, discarded_reason, discarded_from_status
 ## 工作台结构
 
 ```text
-~/lab/
+<workspace>/                 # 默认 ~/lab，也可由 init <目录> 指定
 ├── AGENTS.md               # 所有实验共享的 Agent 规范
 ├── README.md               # 工作台说明
 ├── active/
@@ -226,7 +258,9 @@ discarded_at, discarded_reason, discarded_from_status
 ├── archive/YYYY/MM/
 ├── templates/              # python / node / general
 ├── registry/experiments.jsonl
-└── bin/                    # 预留，不生成全局命令
+├── bin/                    # 预留，不生成全局命令
+├── .agent/skills/lab-management/   # 权威 skill 副本
+└── .agents/skills/lab-management/  # 兼容副本（ZCode 等通用发现路径）
 ```
 
 实验 README 使用受管理的标记块（`<!-- lab:metadata:start -->` 等）同步元数据。
@@ -249,8 +283,10 @@ registry、生命周期和审计能力。
 
 ```text
 bin/lab-workflow               入口（把仓库 src/ 加入 sys.path）
-src/labworkflow/cli.py         参数解析、输出、错误处理
-src/labworkflow/workspace.py   工作台骨架、模板、刷新、文件锁
+bin/lab-workflow.cmd           Windows 入口（优先 py -3，回退 python）
+src/labworkflow/cli.py         参数解析、根目录解析、输出、错误处理
+src/labworkflow/workspace.py   工作台骨架、模板、skill 安装、刷新、文件锁
+src/labworkflow/compat.py      平台兼容：锁、venv 路径、编码、缓存、原子替换
 src/labworkflow/registry.py    JSONL registry 与状态机
 src/labworkflow/experiments.py 创建、adopt、查询、归档、promote、discard
 src/labworkflow/clean.py       保留策略评估与清理
@@ -259,41 +295,58 @@ src/labworkflow/gitutil.py     Git 初始化、dirty 检测（忽略受管 READM
 src/labworkflow/stats.py       统计
 src/labworkflow/search.py      检索
 src/labworkflow/doctor.py      工作台与 try-rs 集成诊断
-src/labworkflow/assets/        AGENTS.md、README 模板、三类实验模板
-tests/test_lab_workflow.py     端到端测试（隔离 HOME，不触碰真实 ~/lab）
-contrib/systemd/               可选的清理定时器样例（不自动安装）
+src/labworkflow/assets/        AGENTS.md、README 模板、三类实验模板、skills/
+tests/test_lab_workflow.py     端到端测试（隔离 HOME/USERPROFILE，不触碰真实工作台）
+contrib/systemd/               可选的清理定时器样例（Linux，不自动安装）
 ```
 
 ## 测试
 
 ```bash
 python3 -m unittest discover -s tests -v
+# Windows: py -3 -m unittest discover -s tests -v
 ```
 
-测试为每个用例创建临时 `HOME`，通过子进程调用真实的 `./bin/lab-workflow`；默认
+测试为每个用例创建临时 `HOME`/`USERPROFILE`/`LOCALAPPDATA`，通过子进程调用真实的
+`./bin/lab-workflow`（Windows 为 `bin\lab-workflow.cmd` 同一入口逻辑）；默认
 `--no-env`，不依赖网络。
 
 ## 版本与迁移
 
-当前版本 `0.2.0`：
+当前版本 `0.3.0`：
 
-- 项目名 `lab-cli` → `lab-workflow`；
-- 命令 `bin/lab` → `bin/lab-workflow`；
-- Python 包 `labctl` → `labworkflow`；
-- 工作台数据目录仍是 `~/lab`，registry 无需迁移；
-- 已有工作台的文件里若还引用旧命令，运行一次 `./bin/lab-workflow init --refresh`
-  （会覆盖 `AGENTS.md`、`README.md`、`bin/README.md` 和 `templates/` 中由工具生成
-  的内容）；
-- 新增 `adopt`、`doctor`、`init --refresh`；归档实验变为只读；
-- `try-rs` 只作为协作工具，不是代码依赖。
+- 工作台根目录不再硬编码：支持 `init <目录>`、全局 `--root`、
+  `LAB_WORKFLOW_ROOT` 和从当前目录自动发现；默认仍是 `~/lab`；
+- `lab-management` skill 进入仓库资产，`init` 自动安装到
+  `<workspace>/.agent/skills/` 和 `<workspace>/.agents/skills/`，
+  `init --refresh` 更新；
+- 新增 Linux/Windows 兼容层：文件锁、venv `Scripts/` 路径、UTF-8 子进程、
+  read-only 文件清理、AGENTS.md 符号链接回退、Windows 保留名检查；
+- 新增 `bin/lab-workflow.cmd`；
+- 工作台数据格式和默认 `~/lab` 保持兼容，已有 registry 无需迁移。
+
+已有工作台升级：
+
+```bash
+cd ~/project/lab-workflow
+./bin/lab-workflow --root ~/lab init --refresh
+```
+
+`--refresh` 会覆盖 `AGENTS.md`、`README.md`、`bin/README.md`、`templates/` 和
+`.agent`/`.agents` 下的 skill；实验目录和 registry 不受影响。0.2.0 的
+`lab-cli`/`labctl` → `lab-workflow`/`labworkflow` 改名仍然有效。移动工作台目录或
+工具仓库后，运行一次 `init --refresh` 更新生成文档和 skill 里的绝对路径。
 
 ## 已知限制
 
-- 只支持单机、单用户、本地文件系统；`fcntl` 文件锁和符号链接是 Linux 假设。
+- 只支持单机、单用户、本地文件系统；没有 Windows CI，平台相关路径由单元测试覆盖，
+  实际 Windows 行为仍需在目标机器上冒烟验证。
+- Windows 长路径（`.venv` + 实验目录可能超过 260 字符）需要开启系统长路径支持。
 - 没有 unarchive；归档后要继续只能 promote 或手工处理（不推荐）。
 - `promote` 只做过滤复制（排除 `.git`、`.venv`、`node_modules`、缓存、
-  `.lab-meta.json` 和 `AGENTS.md` 链接），不会替你重构代码或 `git init`；
+  `.lab-meta.json` 和受管的 `AGENTS.md`），不会替你重构代码或 `git init`；
   目标目录必须不存在或为空。
-- `adopt` 只接受 `~/lab/active` 下的目录，不负责搬移外部目录的代码。
-- 第一版不安装全局命令；长期使用可把仓库放在固定位置并用绝对路径调用。
+- `adopt` 只接受当前工作台 `active/` 下的目录，不负责搬移外部目录的代码。
+- 不安装全局命令；长期使用可把仓库放在固定位置并用绝对路径调用。
+- `contrib/systemd` 仅适用于 Linux；Windows 暂无等价定时任务样例。
 - 本仓库的 `docs/original.md` 是本地设计稿，已在 `.gitignore` 中排除。

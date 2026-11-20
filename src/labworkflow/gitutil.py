@@ -8,7 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from .util import strip_managed_blocks
+from . import compat
+from .util import atomic_write_text, strip_managed_blocks
 
 EXCLUDE_MARKER = "# lab: experiment environment and metadata"
 EXCLUDE_PATTERNS = (
@@ -20,6 +21,8 @@ EXCLUDE_PATTERNS = (
     ".lab-meta.json",
     "/AGENTS.md",
     ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
     ".env",
 )
 
@@ -32,12 +35,12 @@ def _run(args: Sequence[str], cwd: Path, *, timeout: int = 60) -> subprocess.Com
     env = dict(os.environ)
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
     return subprocess.run(
-        ["git", *args],
+        compat.executable_command(shutil.which("git") or "git", *args),
         cwd=str(cwd),
         capture_output=True,
-        text=True,
         timeout=timeout,
         env=env,
+        **compat.text_subprocess_kwargs(),
     )
 
 
@@ -69,7 +72,13 @@ def write_excludes(path: Path) -> None:
     template or the user's global git configuration.
     """
 
-    exclude_path = path / ".git" / "info" / "exclude"
+    result = _run(["rev-parse", "--git-path", "info/exclude"], path)
+    if result.returncode == 0 and result.stdout.strip():
+        candidate = Path(result.stdout.strip())
+        exclude_path = candidate if candidate.is_absolute() else path / candidate
+    else:
+        exclude_path = path / ".git" / "info" / "exclude"
+
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
     if EXCLUDE_MARKER in existing:
@@ -78,7 +87,7 @@ def write_excludes(path: Path) -> None:
     text = existing
     if text and not text.endswith("\n"):
         text += "\n"
-    exclude_path.write_text(text + "\n".join(block) + "\n", encoding="utf-8")
+    atomic_write_text(exclude_path, text + "\n".join(block) + "\n")
 
 
 def init_repo(path: Path) -> tuple[bool, str]:

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import environment, gitutil
+from . import compat, environment, gitutil
 from .environment import EnvOutcome
 from .errors import LabError, NotFoundError, StateError, UsageError
 from .registry import (
@@ -36,6 +36,7 @@ from .util import (
     unique,
 )
 from .workspace import (
+    AGENTS_MARKER,
     ASSET_ROOT,
     Workspace,
     copy_tree_rendered,
@@ -154,6 +155,9 @@ def render_readme(workspace: Workspace, record: dict[str, Any]) -> str:
         "created_at_display": format_date(record.get("created_at")),
         "workspace_root": str(workspace.root),
         "lab_cmd": workspace.cli_path,
+        "venv_python": compat.venv_python_rel(),
+        "venv_pip": compat.venv_pip_rel(),
+        "venv_activate": compat.venv_activate_rel(),
         "metadata_block": metadata_block(record),
         "description_block": description_block(record),
         "conclusion_block": conclusion_block(record),
@@ -316,11 +320,17 @@ def create_experiment(
             "created_at": created_at,
             "workspace_root": str(workspace.root),
             "lab_cmd": workspace.cli_path,
+            "venv_python": compat.venv_python_rel(),
+            "venv_pip": compat.venv_pip_rel(),
+            "venv_activate": compat.venv_activate_rel(),
             "description": description.strip(),
         }
         try:
             copy_tree_rendered(template_dir, path, mapping)
-            ensure_agents_link(workspace, path)
+            if ensure_agents_link(workspace, path) == "copy":
+                result.warnings.append(
+                    "文件系统不支持符号链接，AGENTS.md 已复制（工作台规则更新后需手动同步）"
+                )
             created_dir = path
 
             record: dict[str, Any] = {
@@ -368,7 +378,7 @@ def create_experiment(
             result.warnings.extend(_sync_all(workspace, record))
         except Exception:
             if created_dir is not None and created_dir.exists():
-                shutil.rmtree(created_dir, ignore_errors=True)
+                compat.safe_rmtree(created_dir, ignore_errors=True)
             raise
     return result
 
@@ -423,12 +433,13 @@ def detect_template(path: Path) -> str:
 
 
 def _detect_env(path: Path, template: str) -> dict[str, Any] | None:
-    if template == "python" and (path / ".venv" / "bin" / "python").exists():
+    venv = path / ".venv"
+    if template == "python" and compat.venv_python(venv).exists():
         return {
             "type": "python",
             "path": ".venv",
             "ok": True,
-            "pip": (path / ".venv" / "bin" / "pip").exists(),
+            "pip": compat.venv_pip(venv).exists(),
         }
     if template == "node" and (path / "node_modules").is_dir():
         return {"type": "node", "path": "node_modules", "ok": True}
@@ -472,7 +483,7 @@ def adopt_experiment(
     active_root = workspace.active.resolve()
     if path == active_root or not path.is_relative_to(active_root):
         raise UsageError(
-            f"adopt 只接受 ~/lab/active 下的目录: {path}\n"
+            f"adopt 只接受 {workspace.active} 下的目录: {path}\n"
             "可以先把目录移入 active/，或用 lab-workflow new 重新创建。"
         )
 
@@ -541,7 +552,10 @@ def adopt_experiment(
                     result.warnings.append(
                         "README 已存在但没有 lab-workflow 标记块，元数据不会同步进 README"
                     )
-            ensure_agents_link(workspace, path)
+            if ensure_agents_link(workspace, path) == "copy":
+                result.warnings.append(
+                    "文件系统不支持符号链接，AGENTS.md 已复制（工作台规则更新后需手动同步）"
+                )
 
             if no_git:
                 existing = gitutil.is_repo(path)
@@ -849,7 +863,17 @@ PROMOTE_IGNORE = {
     ".idea",
     ".lab-meta.json",
     ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    "$RECYCLE.BIN",
 }
+
+
+def _is_lab_agents(path: Path) -> bool:
+    try:
+        return AGENTS_MARKER in path.read_text(encoding="utf-8", errors="replace")[:2000]
+    except OSError:
+        return False
 
 
 def _copy_project(source: Path, target: Path) -> None:
@@ -859,15 +883,19 @@ def _copy_project(source: Path, target: Path) -> None:
         if name in PROMOTE_IGNORE:
             continue
         destination = target / name
+        if name == "AGENTS.md" and (entry.is_symlink() or _is_lab_agents(entry)):
+            # The workspace-level AGENTS.md is a lab-internal link/copy.
+            continue
         if entry.is_symlink():
-            if name == "AGENTS.md":
-                # The workspace-level AGENTS.md is a lab-internal link.
-                continue
             try:
-                os.symlink(os.readlink(entry), destination)
+                os.symlink(
+                    os.readlink(entry),
+                    destination,
+                    target_is_directory=entry.is_dir(),
+                )
             except OSError:
                 if entry.is_dir():
-                    shutil.copytree(entry, destination, symlinks=True)
+                    shutil.copytree(entry, destination, symlinks=False)
                 else:
                     shutil.copy2(entry, destination)
         elif entry.is_dir():
@@ -918,7 +946,7 @@ def promote_experiment(
         else:
             destination = destination.resolve()
         if destination == workspace.root or destination.is_relative_to(workspace.root):
-            raise UsageError("promote 目标不能位于工作台 ~/lab 内")
+            raise UsageError(f"promote 目标不能位于工作台 {workspace.root} 内")
         if destination == source or destination.is_relative_to(source):
             raise UsageError("promote 目标不能是实验目录本身")
         if destination.exists():
@@ -932,7 +960,7 @@ def promote_experiment(
             _copy_project(source, destination)
         except OSError as exc:
             if created_target and destination.exists():
-                shutil.rmtree(destination, ignore_errors=True)
+                compat.safe_rmtree(destination, ignore_errors=True)
             raise StateError(f"复制实验文件失败: {exc}") from exc
 
         previous_status = status
@@ -941,14 +969,14 @@ def promote_experiment(
             candidate = _archive_target(workspace, record)
             if candidate.exists():
                 if created_target:
-                    shutil.rmtree(destination, ignore_errors=True)
+                    compat.safe_rmtree(destination, ignore_errors=True)
                 raise StateError(f"归档目标已存在: {candidate}")
             candidate.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.move(str(source), str(candidate))
             except OSError as exc:
                 if created_target:
-                    shutil.rmtree(destination, ignore_errors=True)
+                    compat.safe_rmtree(destination, ignore_errors=True)
                 raise StateError(f"promote 后归档源实验失败: {exc}") from exc
             archive_path = candidate
             record["path"] = workspace.relative(candidate)
@@ -967,7 +995,7 @@ def promote_experiment(
                 except OSError:
                     pass
             if created_target:
-                shutil.rmtree(destination, ignore_errors=True)
+                compat.safe_rmtree(destination, ignore_errors=True)
             raise
         warnings = _sync_all(workspace, record)
     return PromoteResult(
@@ -1019,7 +1047,7 @@ def discard_experiment(
             try:
                 shutil.move(str(source), str(trashed))
             except OSError as exc:
-                shutil.rmtree(trash_parent, ignore_errors=True)
+                compat.safe_rmtree(trash_parent, ignore_errors=True)
                 raise StateError(f"无法移走实验目录: {exc}") from exc
 
         previous_status = status
@@ -1044,13 +1072,13 @@ def discard_experiment(
                 except OSError:
                     pass
             if trash_parent is not None:
-                shutil.rmtree(trash_parent, ignore_errors=True)
+                compat.safe_rmtree(trash_parent, ignore_errors=True)
             raise
 
         warnings: list[str] = []
         if trash_parent is not None:
             try:
-                shutil.rmtree(trash_parent)
+                compat.safe_rmtree(trash_parent)
             except OSError as exc:
                 warnings.append(f"临时删除目录清理失败（不影响 registry）: {exc}")
     return DiscardResult(record=record, old_path=old_path if existing else None, warnings=warnings)

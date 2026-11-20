@@ -15,17 +15,24 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from labworkflow import compat, util  # noqa: E402
+from labworkflow.workspace import resolve_root  # noqa: E402
+
 LAB = ROOT / "bin" / "lab-workflow"
 PYTHON = sys.executable
 ID_RE = re.compile(r"实验已创建: (\d{8}-\d{3})")
 
 
+@unittest.skipUnless(shutil.which("git"), "git is required for end-to-end tests")
 class LabCase(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp(prefix="lab-test-"))
-        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.addCleanup(compat.safe_rmtree, self.home, ignore_errors=True)
         self.lab_root = self.home / "lab"
 
     # ------------------------------------------------------------------
@@ -36,16 +43,28 @@ class LabCase(unittest.TestCase):
         *args: str,
         input_text: str | None = None,
         timeout: int = 120,
+        cwd: Path | None = None,
+        env_extra: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["HOME"] = str(self.home)
+        env["USERPROFILE"] = str(self.home)
         env["XDG_CACHE_HOME"] = str(self.home / ".cache")
+        env["LOCALAPPDATA"] = str(self.home / "AppData" / "Local")
+        env["APPDATA"] = str(self.home / "AppData" / "Roaming")
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         env.pop("LAB_DEBUG", None)
+        env.pop("LAB_WORKFLOW_ROOT", None)
+        if env_extra:
+            env.update(env_extra)
         return subprocess.run(
             [PYTHON, str(LAB), *[str(arg) for arg in args]],
-            cwd=str(ROOT),
+            cwd=str(cwd or ROOT),
             env=env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             input=input_text,
             stdin=subprocess.DEVNULL if input_text is None else None,
             capture_output=True,
@@ -64,11 +83,14 @@ class LabCase(unittest.TestCase):
         self.assertIsNotNone(match, proc.stdout)
         return match.group(1)
 
-    def records(self) -> list[dict]:
-        path = self.lab_root / "registry" / "experiments.jsonl"
+    def records_at(self, root: Path) -> list[dict]:
+        path = root / "registry" / "experiments.jsonl"
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def records(self) -> list[dict]:
+        return self.records_at(self.lab_root)
 
     def record(self, identifier: str) -> dict:
         for record in self.records():
@@ -103,6 +125,8 @@ class LabCase(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         proc = subprocess.run(
             [
@@ -113,6 +137,8 @@ class LabCase(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -171,11 +197,18 @@ class LabCase(unittest.TestCase):
         self.assertTrue(path.is_dir())
         self.assertTrue((path / "README.md").is_file())
         self.assertTrue((path / ".lab-meta.json").is_file())
-        self.assertTrue((path / "AGENTS.md").is_symlink())
-        self.assertEqual(
-            (path / "AGENTS.md").resolve(),
-            (self.lab_root / "AGENTS.md").resolve(),
-        )
+        agents = path / "AGENTS.md"
+        self.assertTrue(agents.is_symlink() or agents.is_file())
+        if agents.is_symlink():
+            self.assertEqual(
+                agents.resolve(),
+                (self.lab_root / "AGENTS.md").resolve(),
+            )
+        else:
+            self.assertIn(
+                "lab:workspace-agents",
+                agents.read_text(encoding="utf-8"),
+            )
         self.assertTrue((path / ".git").is_dir())
         log = subprocess.run(
             ["git", "-C", str(path), "log", "--oneline"],
@@ -603,7 +636,8 @@ class LabCase(unittest.TestCase):
         self.assertEqual(record["slug"], "rust-probe")
         self.assertEqual(record["template"], "general")
         self.assertEqual(record["path"], "active/2026-11-19-rust-probe")
-        self.assertTrue((directory / "AGENTS.md").is_symlink())
+        agents = directory / "AGENTS.md"
+        self.assertTrue(agents.is_symlink() or agents.is_file())
         self.assertTrue((directory / ".lab-meta.json").is_file())
         self.assertIn("我自己的笔记", (directory / "README.md").read_text(encoding="utf-8"))
 
@@ -669,6 +703,93 @@ class LabCase(unittest.TestCase):
         self.assertIn("lab-workflow", template.read_text(encoding="utf-8"))
         self.assertEqual(self.record(identifier)["status"], "created")
 
+    def test_init_refuses_home_root(self) -> None:
+        proc = self.run_lab("init", str(self.home))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("主目录", proc.stderr)
+        self.assertFalse((self.home / "active").exists())
+
+    def test_init_custom_root_installs_skill(self) -> None:
+        custom = (self.home / "custom-lab").resolve()
+        proc = self.run_lab("init", str(custom))
+        self.assert_ok(proc)
+        self.assertTrue((custom / "registry" / "experiments.jsonl").is_file())
+        self.assertFalse(self.lab_root.exists())
+        self.assertIn(str(custom), proc.stdout)
+        self.assertIn("--root", proc.stdout)
+
+        for parent in (".agent", ".agents"):
+            skill = custom / parent / "skills" / "lab-management" / "SKILL.md"
+            self.assertTrue(skill.is_file(), skill)
+            text = skill.read_text(encoding="utf-8")
+            self.assertIn("name: lab-management", text)
+            self.assertIn(str(custom), text)
+            expected_cmd = LAB.with_suffix(".cmd") if os.name == "nt" else LAB
+            self.assertIn(str(expected_cmd.resolve()), text)
+            self.assertNotIn("{{", text)
+
+        reference = custom / ".agent" / "skills" / "lab-management" / "references" / "commands.md"
+        self.assertTrue(reference.is_file())
+        self.assertNotIn("{{", reference.read_text(encoding="utf-8"))
+
+    def test_root_resolution_modes(self) -> None:
+        custom = (self.home / "custom-lab").resolve()
+        self.assert_ok(self.run_lab("init", str(custom)))
+
+        explicit = self.run_lab(
+            "--root", str(custom), "new", "root-flag", "--no-env", "--no-git"
+        )
+        self.assert_ok(explicit)
+
+        from_env = self.run_lab(
+            "new", "env-root", "--no-env", "--no-git",
+            env_extra={"LAB_WORKFLOW_ROOT": str(custom)},
+        )
+        self.assert_ok(from_env)
+
+        from_cwd = self.run_lab(
+            "new", "cwd-root", "--no-env", "--no-git",
+            cwd=custom / "active",
+        )
+        self.assert_ok(from_cwd)
+
+        self.assertEqual(len(self.records_at(custom)), 3)
+        self.assertFalse(self.lab_root.exists())
+
+    def test_init_refresh_restores_skill(self) -> None:
+        custom = (self.home / "custom-lab").resolve()
+        self.assert_ok(self.run_lab("init", str(custom)))
+        skills = [
+            custom / ".agent" / "skills" / "lab-management" / "SKILL.md",
+            custom / ".agents" / "skills" / "lab-management" / "SKILL.md",
+        ]
+        for skill in skills:
+            skill.write_text("stale skill\n", encoding="utf-8")
+
+        proc = self.run_lab("init", str(custom), "--refresh")
+        self.assert_ok(proc)
+        for skill in skills:
+            text = skill.read_text(encoding="utf-8")
+            self.assertIn("name: lab-management", text)
+            self.assertNotIn("stale", text)
+            self.assertNotIn("{{", text)
+
+    def test_promote_skips_copied_agents_marker(self) -> None:
+        self.init()
+        identifier = self.create("Copied Agents", "--template", "general")
+        path = self.exp_path(self.record(identifier))
+        agents = path / "AGENTS.md"
+        if agents.is_symlink():
+            agents.unlink()
+        shutil.copy2(self.lab_root / "AGENTS.md", agents)
+        self.assertFalse(agents.is_symlink())
+
+        self.assert_ok(self.run_lab("status", identifier, "success"))
+        self.git_commit_all(path)
+        target = self.home / "workspace" / "copied-agents"
+        self.assert_ok(self.run_lab("promote", identifier, "--to", str(target)))
+        self.assertFalse((target / "AGENTS.md").exists())
+
     # ------------------------------------------------------------------
     # lifecycle safety
     # ------------------------------------------------------------------
@@ -721,6 +842,118 @@ class LabCase(unittest.TestCase):
         promoted = self.run_lab("promote", identifier, "--to", str(target))
         self.assert_ok(promoted)
         self.assertEqual(self.record(identifier)["status"], "promoted")
+
+
+class CompatCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="lab-compat-"))
+        self.addCleanup(compat.safe_rmtree, self.tmp, ignore_errors=True)
+
+    def test_venv_paths_are_platform_aware(self) -> None:
+        self.assertEqual(
+            compat.venv_python(Path(".venv"), windows=False).as_posix(),
+            ".venv/bin/python",
+        )
+        self.assertEqual(
+            compat.venv_python(Path(".venv"), windows=True).as_posix(),
+            ".venv/Scripts/python.exe",
+        )
+        self.assertEqual(
+            compat.venv_pip(Path(".venv"), windows=False).as_posix(),
+            ".venv/bin/pip",
+        )
+        self.assertEqual(
+            compat.venv_pip(Path(".venv"), windows=True).as_posix(),
+            ".venv/Scripts/pip.exe",
+        )
+        self.assertEqual(
+            compat.venv_activate_rel(windows=False),
+            ".venv/bin/activate",
+        )
+        self.assertEqual(
+            compat.venv_activate_rel(windows=True),
+            ".venv/Scripts/activate.bat",
+        )
+
+    def test_cache_dir_prefers_platform_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"XDG_CACHE_HOME": str(self.tmp / "xdg")}, clear=False
+        ):
+            self.assertEqual(
+                compat.cache_dir(windows=False),
+                self.tmp / "xdg" / "lab-workflow",
+            )
+        with mock.patch.dict(
+            os.environ, {"LOCALAPPDATA": str(self.tmp / "local")}, clear=False
+        ):
+            self.assertEqual(
+                compat.cache_dir(windows=True),
+                self.tmp / "local" / "lab-workflow",
+            )
+
+    def test_cli_executable_prefers_windows_cmd(self) -> None:
+        repo = self.tmp / "repo"
+        (repo / "bin").mkdir(parents=True)
+        (repo / "bin" / "lab-workflow").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        self.assertEqual(
+            Path(compat.cli_executable(repo, windows=False)).name,
+            "lab-workflow",
+        )
+        (repo / "bin" / "lab-workflow.cmd").write_text("@echo off\n", encoding="utf-8")
+        self.assertEqual(
+            Path(compat.cli_executable(repo, windows=True)).name,
+            "lab-workflow.cmd",
+        )
+
+    def test_windows_reserved_names_are_rejected(self) -> None:
+        for name in ("con", "PRN", "aux", "nul", "com1", "lpt9"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    util.slugify(name)
+        self.assertEqual(util.slugify("console"), "console")
+        self.assertEqual(util.slugify("com10"), "com10")
+
+    def test_subprocess_text_kwargs_are_utf8(self) -> None:
+        self.assertEqual(
+            compat.text_subprocess_kwargs(),
+            {"encoding": "utf-8", "errors": "replace"},
+        )
+
+    def test_executable_command_wraps_windows_cmd(self) -> None:
+        with mock.patch.dict(os.environ, {"COMSPEC": "cmd.exe"}, clear=False):
+            with mock.patch("labworkflow.compat.is_windows", return_value=True):
+                self.assertEqual(
+                    compat.executable_command("npm.cmd", "install"),
+                    ["cmd.exe", "/c", "npm.cmd", "install"],
+                )
+        self.assertEqual(
+            compat.executable_command("git", "status"),
+            ["git", "status"],
+        )
+
+    def test_root_resolution_precedence(self) -> None:
+        explicit = self.tmp / "explicit"
+        env_root = self.tmp / "env"
+        discovered = self.tmp / "discovered"
+        (discovered / "active").mkdir(parents=True)
+        (discovered / "registry").mkdir()
+        (discovered / "registry" / "experiments.jsonl").write_text("", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ, {"LAB_WORKFLOW_ROOT": str(env_root)}, clear=False
+        ):
+            self.assertEqual(resolve_root(explicit), explicit.resolve())
+            self.assertEqual(resolve_root(None), env_root.resolve())
+
+        with mock.patch.dict(os.environ, {"LAB_WORKFLOW_ROOT": ""}, clear=False):
+            self.assertEqual(
+                resolve_root(None, start=discovered / "active"),
+                discovered.resolve(),
+            )
+            self.assertEqual(
+                resolve_root(None, start=self.tmp),
+                (Path.home() / "lab").resolve(),
+            )
 
 
 if __name__ == "__main__":
