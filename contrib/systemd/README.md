@@ -1,7 +1,7 @@
 # 可选的 systemd 定时清理
 
 这两个文件是**样例**，仓库不会自动安装或启用它们。默认路径假设 lab 仓库位于
-`~/project/lab-workflow`；如果你的路径不同，请同时修改 service 中的
+`~/code/lab-workflow`；如果你的路径不同，请同时修改 service 中的
 `WorkingDirectory` 和 `ExecStart`。如果工作台根目录不是 `~/lab`，在
 `ExecStart` 的 `clean` 前加 `--root <目录>`。
 
@@ -10,7 +10,7 @@ systemd 仅适用于 Linux；Windows 暂无等价的计划任务样例。
 启用前先用演练模式确认会删什么：
 
 ```bash
-cd ~/project/lab-workflow
+cd ~/code/lab-workflow
 ./bin/lab-workflow clean
 ```
 

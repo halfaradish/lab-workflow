@@ -93,7 +93,7 @@ try-rs 或手工创建的目录没有 registry 记录，用 `adopt` 原地登记
 ```bash
 cd ~/lab/active
 try-rs nightly-probe        # try-rs 创建目录
-cd ~/project/lab-workflow
+cd ~/code/lab-workflow
 ./bin/lab-workflow adopt ~/lab/active/nightly-probe --template python
 ```
 
@@ -115,7 +115,7 @@ cd ~/project/lab-workflow
 要求：Python 3.10+、Git；Python/Node 实验需要对应运行时。只依赖 Python 标准库。
 
 ```bash
-cd ~/project/lab-workflow
+cd ~/code/lab-workflow
 ./bin/lab-workflow init              # 默认工作台 ~/lab
 # 或：./bin/lab-workflow init /data/lab
 
@@ -139,7 +139,7 @@ cd "$(./bin/lab-workflow open websocket-test)"
 ```
 
 `init` 还会把 `lab-management` skill 安装到工作台的 `.agent/skills/` 和
-`.agents/skills/`。后者是 ZCode 等运行时的通用发现路径；`init --refresh` 会同时更新
+`.agents/skills/`。后者是通用 Agent 运行时的发现路径；`init --refresh` 会同时更新
 两份。skill 里预留了工作台根目录和 CLI 路径，安装时按当前机器渲染。
 
 ### Windows
@@ -239,7 +239,7 @@ discarded_at, discarded_reason, discarded_from_status
 ## 环境隔离
 
 - **Python**：实验内 `.venv/`。宿主机缺 `ensurepip` 时先用 `--without-pip`，
-  再从 `https://bootstrap.pypa.io/get-pip.py` 下载到缓存目录
+  再从 PyPA 官方引导脚本 `https://bootstrap.pypa.io/get-pip.py` 下载到缓存目录
   （Linux: `$XDG_CACHE_HOME/lab-workflow` 或 `~/.cache/lab-workflow`；
   Windows: `%LOCALAPPDATA%\lab-workflow`），只在实验 venv 内安装 pip。网络失败只警告。
   Windows 的解释器在 `.venv\Scripts\python.exe`。
@@ -260,7 +260,7 @@ discarded_at, discarded_reason, discarded_from_status
 ├── registry/experiments.jsonl
 ├── bin/                    # 预留，不生成全局命令
 ├── .agent/skills/lab-management/   # 权威 skill 副本
-└── .agents/skills/lab-management/  # 兼容副本（ZCode 等通用发现路径）
+└── .agents/skills/lab-management/  # 兼容副本（通用 Agent 运行时发现路径）
 ```
 
 实验 README 使用受管理的标记块（`<!-- lab:metadata:start -->` 等）同步元数据。
@@ -328,7 +328,7 @@ python3 -m unittest discover -s tests -v
 已有工作台升级：
 
 ```bash
-cd ~/project/lab-workflow
+cd ~/code/lab-workflow
 ./bin/lab-workflow --root ~/lab init --refresh
 ```
 
@@ -349,4 +349,7 @@ cd ~/project/lab-workflow
 - `adopt` 只接受当前工作台 `active/` 下的目录，不负责搬移外部目录的代码。
 - 不安装全局命令；长期使用可把仓库放在固定位置并用绝对路径调用。
 - `contrib/systemd` 仅适用于 Linux；Windows 暂无等价定时任务样例。
-- 本仓库的 `docs/original.md` 是本地设计稿，已在 `.gitignore` 中排除。
+
+## 许可证
+
+[MIT](LICENSE)。

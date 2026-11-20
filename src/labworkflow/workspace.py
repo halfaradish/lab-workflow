@@ -196,7 +196,7 @@ class Workspace:
         """Install the bundled project-level skills into this workspace.
 
         Both ``.agent`` (canonical per workspace convention) and ``.agents``
-        (the universal/ZCode discovery path) receive a real copy. Copies keep
+        (the generic agent-runtime discovery path) receive a real copy. Copies keep
         Windows free of symlink-privilege requirements and can be refreshed
         together with the other managed assets.
         """

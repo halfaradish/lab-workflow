@@ -25,3 +25,10 @@ npm-debug.log*
 .env.*
 *.local
 *.log
+*.pem
+*.key
+*.p12
+id_rsa*
+.ssh/
+secrets/
+credentials*

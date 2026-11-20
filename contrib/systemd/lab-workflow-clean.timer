@@ -1,6 +1,6 @@
 [Unit]
 Description=Run lab-workflow retention cleanup daily
-Documentation=file:%h/project/lab-workflow/README.md
+Documentation=file:%h/code/lab-workflow/README.md
 
 [Timer]
 OnCalendar=*-*-* 04:30:00
