@@ -159,11 +159,15 @@ bin\lab-workflow.cmd new websocket-test --template python
 
 1. 分配 `YYYYMMDD-NNN` 全局唯一 ID；
 2. 在 `active/` 下创建 `YYYYMMDD-NNN-kebab-name/`；
-3. 渲染模板，生成结构化 `README.md` 和 `.lab-meta.json`；
+3. 渲染模板，生成结构化 `README.md`、`.lab-meta.json` 和 `.gitattributes`；
 4. 创建指向 `<workspace>/AGENTS.md` 的 `AGENTS.md` 符号链接（Windows 上退化为受管副本）；
 5. 初始化 Git 并提交初始快照；
-6. 按模板创建实验内 Python `.venv` 或 Node `node_modules`；
+6. 按模板创建实验内 Python `.venv` 或 Node `node_modules`（Python 会安装 `requirements.txt`）；
 7. 写入 `registry/experiments.jsonl`。
+
+模板的 `.gitattributes` 默认 `* text=auto`，Windows 上提交文本/CSV 不再反复提示
+CRLF 转换。实验仓库和作为 Git 仓库的工作台都会设置 `core.quotepath=false`，
+`git status` 里的中文文件名保持原样。
 
 ## 命令
 
@@ -176,7 +180,7 @@ bin\lab-workflow.cmd new websocket-test --template python
 | `lab-workflow show <ref>` | 显示详情和路径；`--json` 输出结构化数据 |
 | `lab-workflow open <ref>` | 只打印绝对路径；`--shell` 是无 try-rs 时的降级方案 |
 | `lab-workflow status <ref> <state>` | 更新 `created` / `running` / `success`（别名 `start` / `done`） |
-| `lab-workflow meta <ref> ...` | 更新摘要、结论、分类、标签、技术栈、相关项目 |
+| `lab-workflow meta <ref> ...` | 更新摘要、结论、分类、标签、技术栈、相关项目；`--adopt-readme` 采纳 README 手工内容，`--strict` 拒绝覆盖 |
 | `lab-workflow archive <ref>` | 移动到 `archive/YYYY/MM/`，状态变为 `ARCHIVED` |
 | `lab-workflow promote <ref>` | 只允许 `SUCCESS`/`ARCHIVED`，复制到 `~/workspace/<name>` 或 `--to` |
 | `lab-workflow discard <ref>` | 删除目录并保留 registry 墓碑；非交互必须 `--yes` |
@@ -185,14 +189,25 @@ bin\lab-workflow.cmd new websocket-test --template python
 | `lab-workflow search [query]` | 在元数据和 README 中检索；支持标签、状态、模板、分类、技术过滤 |
 | `lab-workflow doctor` | 检查工作台、Git/Python/npm、try-rs 集成和未登记目录 |
 
-`<ref>` 可以是完整 ID、唯一名称或 slug。不支持把 `001` 当作 ID 简写。
+`<ref>` 支持完整 ID、唯一名称、slug，以及实验目录名（如 `20261120-001-demo`）
+和唯一前缀（如 `20261120-001`、`demo`）；短写 `20261120-1` 会归一化为
+`20261120-001`。前缀命中多个实验时会报歧义并列出候选 ID。
 
 ### 未提交更改的判定
 
 `status` / `meta` 会改写实验 README 里的受管区块（`<!-- lab:metadata:start -->` 等）。
-这类工具自身产生的差异**不算未提交更改**，因此正常走完 `status → meta → archive /
-promote` 不需要 `--force`。用户自己改 README 其他章节、代码或新增文件，仍然会被
-`archive` / `promote` / `discard` / `clean` 拦截。
+同步前工具会比较磁盘区块与 registry 的渲染结果；渲染结果没有变化时不写文件，也不
+刷新 `updated_at`。这类工具自身产生的差异**不算未提交更改**，因此正常走完
+`status → meta → archive / promote` 不需要 `--force`。用户自己改 README 其他章节、
+代码或新增文件，仍然会被 `archive` / `promote` / `discard` / `clean` 拦截。
+
+受管区块不是单向覆盖：
+
+- `metadata` 区块被手工修改时会打印警告，然后按 registry 重新渲染；
+- `description` / `conclusion` 区块中的非空手写内容会默认采纳回 registry
+  （`status`、`archive`、`promote` 时优先保留，尤其不会丢结论）；
+- `meta --adopt-readme` 可在没有其他字段时单独采纳 README 内容；
+- `meta --strict` 检测到任何手工修改时直接拒绝（退出码 4），不写 README 或 registry。
 
 ### 元数据
 
@@ -200,13 +215,14 @@ promote` 不需要 `--force`。用户自己改 README 其他章节、代码或�
 
 ```text
 id, name, slug, path, status, template, created_at, updated_at,
-status_changed_at, description, summary, conclusion, category,
+status_changed_at, history, description, summary, conclusion, category,
 tags, technologies, related_projects, git, env,
 archived_at, archived_from_status, promoted_at, promoted_to,
 discarded_at, discarded_reason, discarded_from_status
 ```
 
 通过 `adopt` 登记的记录额外包含 `source: "adopt"` 和 `adopted_at`。
+`history` 是状态变更数组（`{from, to, at}`），`show` 会展示最近 3 条。
 
 `registry/experiments.jsonl` 是唯一权威来源；每次变更原子重写整个文件。
 实验目录里的 `.lab-meta.json` 只是方便本地查看的镜像，且被 Git 忽略。
@@ -242,6 +258,10 @@ discarded_at, discarded_reason, discarded_from_status
   再从 PyPA 官方引导脚本 `https://bootstrap.pypa.io/get-pip.py` 下载到缓存目录
   （Linux: `$XDG_CACHE_HOME/lab-workflow` 或 `~/.cache/lab-workflow`；
   Windows: `%LOCALAPPDATA%\lab-workflow`），只在实验 venv 内安装 pip。网络失败只警告。
+  若实验目录有 `requirements.txt`，随后执行 `pip install -r requirements.txt`；
+  本地 `vendor/` 目录中的 wheel 会作为 `--find-links` 源，便于离线或私有包。
+  安装失败只警告不阻断，纯注释的 `requirements.txt` 会跳过；`doctor` 会检查
+  `requirements.txt` 在环境初始化后是否变化，以及 `.venv/` 是否丢失。
   Windows 的解释器在 `.venv\Scripts\python.exe`。
 - **Node**：实验内 `npm install`，依赖进入 `node_modules/`，不使用 `npm -g`。
 - **general**：不创建语言环境。
@@ -263,7 +283,9 @@ discarded_at, discarded_reason, discarded_from_status
 ```
 
 实验 README 使用受管理的标记块（`<!-- lab:metadata:start -->` 等）同步元数据。
-用户自己写的章节不会被覆盖；手工删除标记后，工具不再改那一块。
+用户自己写的章节不会被覆盖；手工删除标记后，工具不再改那一块。受管区块内的
+手工编辑会被检测：`metadata` 警告后重渲染，`description`/`conclusion` 默认采纳，
+`meta --adopt-readme` / `--strict` 提供显式控制。
 
 ## 设计边界
 
@@ -312,7 +334,18 @@ python3 -m unittest discover -s tests -v
 
 ## 版本与迁移
 
-当前版本 `0.3.0`：
+当前版本 `0.4.0`：
+
+- README 受管区块双向同步：手写结论/描述可采纳，`meta --adopt-readme` 显式采纳，
+  `meta --strict` 拒绝覆盖混入手工编辑的区块；
+- `<ref>` 支持实验目录名与唯一前缀（含 `20261120-1` 短写归一），歧义时报错并列出候选；
+- 重复 `status` / `meta` 在内容无变化时不写 registry/README，也不刷新 `updated_at`；
+- 状态变更写入 `history`，`show` 展示最近 3 条；
+- Python 模板自动安装 `requirements.txt`，支持 `vendor/` 离线 wheel；
+- 模板新增 `.gitattributes`（`* text=auto`），Git 仓库设置 `core.quotepath=false`；
+- `doctor` 检查 requirements 漂移与 `.venv/` 缺失；实验 README 增加数据/版本控制提示；
+
+0.3.0 起的既有能力：
 
 - 工作台根目录不再硬编码：支持 `init <目录>`、全局 `--root`、
   `LAB_WORKFLOW_ROOT` 和从当前目录自动发现；默认仍是 `~/lab`；
@@ -346,6 +379,8 @@ cd ~/code/lab-workflow
   `.lab-meta.json` 和受管的 `AGENTS.md`），不会替你重构代码或 `git init`；
   目标目录必须不存在或为空。
 - `adopt` 只接受当前工作台 `active/` 下的目录，不负责搬移外部目录的代码。
+- Python 无 `ensurepip` 时需要联网下载 `get-pip.py`；`requirements.txt` 安装失败只
+  警告，`doctor` 会报告漂移，但不会自动重装。
 - 不安装全局命令；长期使用可把仓库放在固定位置并用绝对路径调用。
 - `contrib/systemd` 仅适用于 Linux；Windows 暂无等价定时任务样例。
 
