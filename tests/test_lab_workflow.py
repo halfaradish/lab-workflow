@@ -5,6 +5,8 @@ Every test gets an isolated HOME so the real ~/lab is never touched.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -20,8 +23,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from labworkflow import compat, util  # noqa: E402
+from labworkflow import compat, environment, util  # noqa: E402
 from labworkflow.workspace import resolve_root  # noqa: E402
+
+HAS_ENSUREPIP = importlib.util.find_spec("ensurepip") is not None
 
 LAB = ROOT / "bin" / "lab-workflow"
 PYTHON = sys.executable
@@ -34,6 +39,35 @@ def replace_managed_block(text: str, name: str, content: str) -> str:
         re.DOTALL,
     )
     return pattern.sub(lambda match: match.group(1) + content + match.group(2), text, count=1)
+
+
+def write_wheel(directory: Path, *, name: str = "demo_pkg", version: str = "1.0") -> None:
+    """Write a tiny pure-Python wheel so pip can install fully offline."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    dist = f"{name}-{version}"
+    files = {
+        f"{name}/__init__.py": "VALUE = 42\n",
+        f"{dist}.dist-info/METADATA": (
+            "Metadata-Version: 2.1\n"
+            f"Name: {name.replace('_', '-')}\n"
+            f"Version: {version}\n"
+        ),
+        f"{dist}.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\n"
+            "Generator: lab-test\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    records = []
+    with zipfile.ZipFile(directory / f"{name}-{version}-py3-none-any.whl", "w") as archive:
+        for path, data in files.items():
+            archive.writestr(path, data)
+            payload = data.encode("utf-8")
+            records.append(f"{path},sha256={hashlib.sha256(payload).hexdigest()},{len(payload)}")
+        records.append(f"{dist}.dist-info/RECORD,,")
+        archive.writestr(f"{dist}.dist-info/RECORD", "\n".join(records) + "\n")
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required for end-to-end tests")
@@ -156,6 +190,147 @@ class LabCase(unittest.TestCase):
     # ------------------------------------------------------------------
     # init / new
     # ------------------------------------------------------------------
+    @unittest.skipUnless(HAS_ENSUREPIP, "需要 ensurepip 才能在 venv 内安装 pip")
+    def test_python_template_installs_vendor_requirements(self) -> None:
+        self.init()
+        template = self.lab_root / "templates" / "python"
+        (template / "requirements.txt").write_text("demo-pkg==1.0\n", encoding="utf-8")
+        write_wheel(template / "vendor")
+
+        proc = self.run_lab(
+            "new", "Vendor Deps", "--template", "python",
+            env_extra={"PIP_NO_INDEX": "1"},
+        )
+        self.assert_ok(proc)
+        match = ID_RE.search(proc.stdout)
+        self.assertIsNotNone(match, proc.stdout)
+        identifier = match.group(1)
+        record = self.record(identifier)
+        self.assertEqual(record["env"]["requirements"], "installed")
+        self.assertEqual(record["env"]["requirement_count"], 1)
+        self.assertTrue(record["env"]["vendor"])
+
+        python = compat.venv_python(self.exp_path(record) / ".venv")
+        check = subprocess.run(
+            [str(python), "-c", "import demo_pkg; print(demo_pkg.VALUE)"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertEqual(check.stdout.strip(), "42")
+        shown = self.run_lab("show", identifier)
+        self.assertIn("依赖已安装", shown.stdout)
+
+    @unittest.skipUnless(HAS_ENSUREPIP, "需要 ensurepip 才能在 venv 内安装 pip")
+    def test_python_requirements_failure_only_warns(self) -> None:
+        self.init()
+        template = self.lab_root / "templates" / "python"
+        (template / "requirements.txt").write_text(
+            "definitely-not-a-real-package-lab-test==999\n", encoding="utf-8"
+        )
+
+        proc = self.run_lab(
+            "new", "Broken Deps", "--template", "python",
+            env_extra={"PIP_NO_INDEX": "1"},
+        )
+        self.assert_ok(proc)
+        self.assertIn("requirements.txt", proc.stderr)
+        match = ID_RE.search(proc.stdout)
+        self.assertIsNotNone(match, proc.stdout)
+        record = self.record(match.group(1))
+        self.assertTrue(record["env"]["ok"])
+        self.assertEqual(record["env"]["requirements"], "failed")
+
+    def test_comment_only_requirements_are_skipped(self) -> None:
+        self.init()
+        proc = self.run_lab(
+            "new", "No Deps", "--template", "python",
+            env_extra={"PIP_NO_INDEX": "1"},
+        )
+        self.assert_ok(proc)
+        self.assertIn("跳过安装", proc.stdout)
+        match = ID_RE.search(proc.stdout)
+        self.assertIsNotNone(match, proc.stdout)
+        record = self.record(match.group(1))
+        self.assertEqual(record["env"]["requirements"], "empty")
+
+    def test_requirements_install_command_uses_vendor(self) -> None:
+        experiment = self.home / "exp"
+        experiment.mkdir()
+        (experiment / "requirements.txt").write_text("demo-pkg==1.0\n", encoding="utf-8")
+        vendor = experiment / "vendor"
+        vendor.mkdir()
+        (vendor / "demo_pkg-1.0-py3-none-any.whl").write_bytes(b"wheel")
+        outcome = environment.EnvOutcome()
+        record: dict = {"type": "python", "ok": True, "pip": True}
+
+        with mock.patch.object(environment, "_run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            environment._install_python_requirements(
+                experiment, Path("/fake/python"), True, record, outcome
+            )
+
+        args = run.call_args.args[0]
+        self.assertIn("install", args)
+        self.assertIn(str(experiment / "requirements.txt"), args)
+        self.assertEqual(args[args.index("--find-links") + 1], str(vendor))
+        self.assertEqual(record["requirements"], "installed")
+        self.assertEqual(record["requirement_count"], 1)
+        self.assertIn("已从 requirements.txt 安装 1 条依赖", outcome.messages)
+
+    def test_requirements_install_failure_only_warns(self) -> None:
+        experiment = self.home / "exp"
+        experiment.mkdir()
+        (experiment / "requirements.txt").write_text("missing-pkg==1.0\n", encoding="utf-8")
+        outcome = environment.EnvOutcome()
+        record: dict = {"type": "python", "ok": True, "pip": True}
+
+        with mock.patch.object(environment, "_run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="No matching distribution found"
+            )
+            environment._install_python_requirements(
+                experiment, Path("/fake/python"), True, record, outcome
+            )
+
+        self.assertEqual(record["requirements"], "failed")
+        self.assertIn("失败（实验仍可用）", outcome.warnings[0])
+        self.assertIn("依赖安装失败", environment.environment_summary(record))
+
+    def test_comment_only_requirements_run_nothing(self) -> None:
+        experiment = self.home / "exp"
+        experiment.mkdir()
+        (experiment / "requirements.txt").write_text(
+            "# 只有注释\n\n# requests>=2.32\n", encoding="utf-8"
+        )
+        outcome = environment.EnvOutcome()
+        record: dict = {"type": "python", "ok": True, "pip": True}
+
+        with mock.patch.object(environment, "_run") as run:
+            environment._install_python_requirements(
+                experiment, Path("/fake/python"), True, record, outcome
+            )
+
+        run.assert_not_called()
+        self.assertEqual(record["requirements"], "empty")
+        self.assertIn("无第三方依赖", environment.environment_summary(record))
+
+    def test_requirements_without_pip_are_skipped(self) -> None:
+        experiment = self.home / "exp"
+        experiment.mkdir()
+        (experiment / "requirements.txt").write_text("requests>=2.32\n", encoding="utf-8")
+        outcome = environment.EnvOutcome()
+        record: dict = {"type": "python", "ok": True, "pip": False}
+
+        with mock.patch.object(environment, "_run") as run:
+            environment._install_python_requirements(
+                experiment, Path("/fake/python"), False, record, outcome
+            )
+
+        run.assert_not_called()
+        self.assertEqual(record["requirements"], "skipped")
+        self.assertIn("没有 pip", outcome.warnings[0])
+        self.assertIn("依赖未安装", environment.environment_summary(record))
+
     def test_init_creates_skeleton_and_is_idempotent(self) -> None:
         proc = self.run_lab("init")
         self.assert_ok(proc)

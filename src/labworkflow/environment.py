@@ -144,6 +144,81 @@ def _bootstrap_pip(venv: Path, outcome: EnvOutcome) -> bool:
     return True
 
 
+def _requirements_entries(path: Path) -> list[str]:
+    """Non-empty, non-comment lines from requirements.txt."""
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [
+        line
+        for raw in text.splitlines()
+        if (line := raw.strip()) and not line.startswith("#")
+    ]
+
+
+def _install_python_requirements(
+    experiment_dir: Path,
+    python: Path,
+    has_pip: bool,
+    record: dict,
+    outcome: EnvOutcome,
+) -> None:
+    """Install requirements.txt into the experiment venv.
+
+    A failure only warns: the experiment itself stays usable. ``vendor/``
+    is offered as a local wheel directory for offline or private packages.
+    """
+
+    requirements = experiment_dir / "requirements.txt"
+    if not requirements.is_file():
+        return
+    entries = _requirements_entries(requirements)
+    record["requirements"] = "empty" if not entries else "pending"
+    if not entries:
+        outcome.messages.append("requirements.txt 没有依赖，跳过安装")
+        return
+    if not has_pip:
+        record["requirements"] = "skipped"
+        outcome.warnings.append(
+            "requirements.txt 有依赖，但 venv 内没有 pip，已跳过安装"
+        )
+        return
+
+    args = [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        str(requirements),
+        "--disable-pip-version-check",
+        "--no-input",
+    ]
+    vendor = experiment_dir / "vendor"
+    if vendor.is_dir() and any(vendor.iterdir()):
+        args.extend(["--find-links", str(vendor)])
+        record["vendor"] = True
+    outcome.messages.append("正在安装 requirements.txt 中的依赖…")
+    try:
+        result = _run(args, experiment_dir, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record["requirements"] = "failed"
+        outcome.warnings.append(f"pip install -r requirements.txt 失败（实验仍可用）：{exc}")
+        return
+    if result.returncode != 0:
+        record["requirements"] = "failed"
+        outcome.warnings.append(
+            "pip install -r requirements.txt 失败（实验仍可用）："
+            f"{_tail(result.stderr) or '未知错误'}"
+        )
+        return
+    record["requirements"] = "installed"
+    record["requirement_count"] = len(entries)
+    outcome.messages.append(f"已从 requirements.txt 安装 {len(entries)} 条依赖")
+
+
 def _setup_python(experiment_dir: Path, outcome: EnvOutcome) -> dict:
     venv = experiment_dir / ".venv"
     python = compat.venv_python(venv)
@@ -181,6 +256,7 @@ def _setup_python(experiment_dir: Path, outcome: EnvOutcome) -> dict:
     record["ok"] = True
     outcome.messages.append("已创建独立 venv: .venv/")
     record["pip"] = _bootstrap_pip(venv, outcome)
+    _install_python_requirements(experiment_dir, python, bool(record["pip"]), record, outcome)
     return record
 
 
@@ -234,7 +310,14 @@ def environment_summary(record: dict | None) -> str:
     if kind == "python":
         pip = "，pip 可用" if record.get("pip") else "，pip 不可用"
         state = "" if record.get("ok") else "，创建失败"
-        return f"Python venv (.venv/){pip}{state}"
+        requirements = record.get("requirements")
+        deps = {
+            "installed": "，依赖已安装",
+            "failed": "，依赖安装失败",
+            "skipped": "，依赖未安装",
+            "empty": "，无第三方依赖",
+        }.get(requirements, "")
+        return f"Python venv (.venv/){pip}{state}{deps}"
     if kind == "node":
         state = "" if record.get("ok") else "，安装失败"
         return f"Node.js 本地依赖 (node_modules/){state}"
