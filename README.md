@@ -350,8 +350,7 @@ python3 -m unittest discover -s tests -v
 - 工作台根目录不再硬编码：支持 `init <目录>`、全局 `--root`、
   `LAB_WORKFLOW_ROOT` 和从当前目录自动发现；默认仍是 `~/lab`；
 - `lab-management` skill 进入仓库资产，`init` 自动安装到
-  `<workspace>/.agent/skills/` 和 `<workspace>/.agents/skills/`，
-  `init --refresh` 更新；
+  `<workspace>/.agents/skills/`，`init --refresh` 更新；
 - 新增 Linux/Windows 兼容层：文件锁、venv `Scripts/` 路径、UTF-8 子进程、
   read-only 文件清理、AGENTS.md 符号链接回退、Windows 保留名检查；
 - 新增 `bin/lab-workflow.cmd`；
@@ -365,7 +364,7 @@ cd ~/code/lab-workflow
 ```
 
 `--refresh` 会覆盖 `AGENTS.md`、`README.md`、`bin/README.md`、`templates/` 和
-`.agent`/`.agents` 下的 skill；实验目录和 registry 不受影响。0.2.0 的
+`.agents` 下的 skill；实验目录和 registry 不受影响。0.2.0 的
 `lab-cli`/`labctl` → `lab-workflow`/`labworkflow` 改名仍然有效。移动工作台目录或
 工具仓库后，运行一次 `init --refresh` 更新生成文档和 skill 里的绝对路径。
 
