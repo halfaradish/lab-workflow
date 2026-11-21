@@ -331,6 +331,47 @@ class LabCase(unittest.TestCase):
         self.assertIn("没有 pip", outcome.warnings[0])
         self.assertIn("依赖未安装", environment.environment_summary(record))
 
+    def test_doctor_flags_requirements_drift_and_missing_venv(self) -> None:
+        self.init()
+        identifier = self.create("Deps Drift", "--template", "python")
+        record = self.record(identifier)
+        path = self.exp_path(record)
+        requirements = path / "requirements.txt"
+        requirements.write_text("requests>=2.32\n", encoding="utf-8")
+        (path / ".venv").mkdir()
+        record["env"] = {
+            "type": "python",
+            "path": ".venv",
+            "ok": True,
+            "pip": True,
+            "requirements": "installed",
+            "requirements_digest": environment.requirements_digest(requirements),
+        }
+        self.write_records([record])
+
+        healthy = self.run_lab("doctor", "--json")
+        self.assert_ok(healthy)
+        self.assertFalse(
+            any("requirements.txt" in message for message in json.loads(healthy.stdout)["warnings"])
+        )
+
+        requirements.write_text("requests>=2.33\n", encoding="utf-8")
+        drifted = self.run_lab("doctor", "--json")
+        self.assert_ok(drifted)
+        self.assertTrue(
+            any(
+                "requirements.txt" in message and "已修改" in message
+                for message in json.loads(drifted.stdout)["warnings"]
+            )
+        )
+
+        shutil.rmtree(path / ".venv")
+        missing = self.run_lab("doctor", "--json")
+        self.assert_ok(missing)
+        self.assertTrue(
+            any(".venv/" in message for message in json.loads(missing.stdout)["warnings"])
+        )
+
     def test_gitattributes_and_quotepath(self) -> None:
         self.init()
         subprocess.run(
@@ -445,6 +486,7 @@ class LabCase(unittest.TestCase):
         self.assertIn("My First Idea", readme)
         self.assertIn("验证一个想法", readme)
         self.assertIn("lab:metadata:start", readme)
+        self.assertIn("数据与版本控制", readme)
 
         shown = self.run_lab("show", identifier, "--json")
         self.assert_ok(shown)

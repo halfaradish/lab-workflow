@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import compat, gitutil
+from . import compat, environment, gitutil
 from .errors import LabError
 from .registry import load_for_read
 from .util import ACTIVE_STATUSES, ALL_STATUSES
@@ -105,6 +105,23 @@ def build_report(workspace: Workspace) -> DoctorReport:
         known_paths.add(path.resolve())
         if record.get("git") and gitutil.is_repo(path) and gitutil.dirty(path):
             report.dirty.append(str(record.get("id")))
+
+        env = record.get("env") or {}
+        if env.get("type") == "python":
+            identifier = str(record.get("id"))
+            requirements = path / "requirements.txt"
+            stored = env.get("requirements_digest")
+            if stored and not requirements.is_file():
+                report.warnings.append(
+                    f"{identifier}: requirements.txt 已被删除，环境与记录不一致"
+                )
+            elif stored and environment.requirements_digest(requirements) != stored:
+                report.warnings.append(
+                    f"{identifier}: requirements.txt 在环境初始化后已修改，"
+                    "请在实验目录重新安装依赖"
+                )
+            if env.get("ok") and not compat.venv_python(path / ".venv").exists():
+                report.warnings.append(f"{identifier}: record 显示已创建 venv，但 .venv/ 不存在")
 
     if workspace.active.is_dir():
         for child in sorted(workspace.active.iterdir(), key=lambda item: item.name):

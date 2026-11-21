@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -144,7 +145,7 @@ def _bootstrap_pip(venv: Path, outcome: EnvOutcome) -> bool:
     return True
 
 
-def _requirements_entries(path: Path) -> list[str]:
+def requirements_entries(path: Path) -> list[str]:
     """Non-empty, non-comment lines from requirements.txt."""
 
     try:
@@ -156,6 +157,16 @@ def _requirements_entries(path: Path) -> list[str]:
         for raw in text.splitlines()
         if (line := raw.strip()) and not line.startswith("#")
     ]
+
+
+def requirements_digest(path: Path) -> str | None:
+    """Stable fingerprint used to detect requirements drift later."""
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 def _install_python_requirements(
@@ -174,7 +185,8 @@ def _install_python_requirements(
     requirements = experiment_dir / "requirements.txt"
     if not requirements.is_file():
         return
-    entries = _requirements_entries(requirements)
+    entries = requirements_entries(requirements)
+    record["requirements_digest"] = requirements_digest(requirements)
     record["requirements"] = "empty" if not entries else "pending"
     if not entries:
         outcome.messages.append("requirements.txt 没有依赖，跳过安装")
