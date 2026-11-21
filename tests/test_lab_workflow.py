@@ -651,19 +651,20 @@ class LabCase(unittest.TestCase):
 
     def test_adopt_keeps_embedded_id_and_detects_node(self) -> None:
         self.init()
-        directory = self.lab_root / "active" / "20261120-007-try-dir"
+        today = datetime.now().strftime("%Y%m%d")
+        directory = self.lab_root / "active" / f"{today}-007-try-dir"
         directory.mkdir()
         (directory / "package.json").write_text('{"name": "x"}\n', encoding="utf-8")
 
         proc = self.run_lab("adopt", str(directory))
         self.assert_ok(proc)
         record = self.records()[0]
-        self.assertEqual(record["id"], "20261120-007")
+        self.assertEqual(record["id"], f"{today}-007")
         self.assertEqual(record["template"], "node")
         self.assertEqual(record["slug"], "try-dir")
 
         following = self.create("After Adopt", "--template", "general")
-        self.assertEqual(following, "20261120-008")
+        self.assertEqual(following, f"{today}-008")
 
     def test_doctor_reports_try_rs_integration(self) -> None:
         self.init()
