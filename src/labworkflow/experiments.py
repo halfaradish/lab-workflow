@@ -711,6 +711,16 @@ def show_text(workspace: Workspace, record: dict[str, Any]) -> str:
     if record.get("conclusion"):
         lines.append("结论:")
         lines.append(str(record["conclusion"]))
+    history = record.get("history")
+    if isinstance(history, list):
+        recent = [entry for entry in history if isinstance(entry, dict)][-3:]
+        if recent:
+            lines.append("")
+            lines.append("状态历史（最近 3 条）:")
+            for entry in recent:
+                source = status_label(str(entry.get("from") or "?"))
+                target = status_label(str(entry.get("to") or "?"))
+                lines.append(f"  {source} → {target}  {format_date(entry.get('at'))}")
     return "\n".join(lines).rstrip()
 
 
@@ -1059,9 +1069,7 @@ def discard_experiment(
                 record["discarded_from_status"] = previous_status
             else:
                 # Missing directory: still close the record.
-                record["status"] = "discarded"
-                record["status_changed_at"] = now_iso()
-                record["updated_at"] = now_iso()
+                set_status(record, "discarded")
                 record["discarded_at"] = now_iso()
                 record["discarded_reason"] = reason + " (目录已缺失)"
             registry.write_record(record)

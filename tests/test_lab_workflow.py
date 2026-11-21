@@ -356,6 +356,41 @@ class LabCase(unittest.TestCase):
         empty_meta = self.run_lab("meta", identifier)
         self.assertEqual(empty_meta.returncode, 2, empty_meta.stderr)
 
+    def test_status_history_is_recorded_and_shown(self) -> None:
+        self.init()
+        identifier = self.create("History", "--template", "general")
+        for status in ("running", "success", "running", "success"):
+            self.assert_ok(self.run_lab("status", identifier, status))
+
+        record = self.record(identifier)
+        self.assertEqual(
+            [(entry["from"], entry["to"]) for entry in record["history"]],
+            [
+                ("created", "running"),
+                ("running", "success"),
+                ("success", "running"),
+                ("running", "success"),
+            ],
+        )
+        for entry in record["history"]:
+            self.assertIsNotNone(util.parse_timestamp(entry["at"]), entry["at"])
+        self.assertEqual(record["status_changed_at"], record["history"][-1]["at"])
+
+        shown = self.run_lab("show", identifier)
+        self.assert_ok(shown)
+        self.assertIn("状态历史（最近 3 条）", shown.stdout)
+        self.assertNotIn("CREATED → RUNNING", shown.stdout)
+        self.assertEqual(shown.stdout.count("RUNNING → SUCCESS"), 2)
+
+        # Old registries have no history key; read-only and mutating commands
+        # must keep working and start recording from the next transition.
+        legacy = dict(record)
+        legacy.pop("history")
+        self.write_records([legacy])
+        self.assert_ok(self.run_lab("show", identifier))
+        self.assert_ok(self.run_lab("status", identifier, "running"))
+        self.assertEqual(len(self.record(identifier)["history"]), 1)
+
     def test_custom_readme_sections_survive(self) -> None:
         self.init()
         identifier = self.create("Readme Keep", "--template", "general")

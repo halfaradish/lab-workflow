@@ -194,6 +194,11 @@ def set_status(record: dict[str, Any], status: str, *, when: str | None = None) 
     record["status"] = status
     record["status_changed_at"] = stamp
     record["updated_at"] = stamp
+    history = record.get("history")
+    if not isinstance(history, list):
+        history = []
+    history.append({"from": str(previous), "to": status, "at": stamp})
+    record["history"] = history
 
 
 def active(record: dict[str, Any]) -> bool:
