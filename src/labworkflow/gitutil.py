@@ -63,6 +63,19 @@ def _identity_config(path: Path) -> list[str]:
     return args
 
 
+def configure_repo(path: Path) -> bool:
+    """Apply repo-local settings the lab relies on.
+
+    ``core.quotepath=false`` keeps non-ASCII (for example Chinese) file
+    names readable in ``git status`` output instead of octal escapes.
+    """
+
+    if not is_repo(path):
+        return False
+    _run(["config", "core.quotepath", "false"], path)
+    return True
+
+
 def write_excludes(path: Path) -> None:
     """Add lab-local ignore rules to ``.git/info/exclude``.
 
@@ -104,6 +117,7 @@ def init_repo(path: Path) -> tuple[bool, str]:
         detail = result.stderr.strip() or result.stdout.strip()
         return False, f"git init 失败：{detail}"
     write_excludes(path)
+    configure_repo(path)
     result = _run(["add", "-A"], path)
     if result.returncode != 0:
         return True, f"git 仓库已初始化，但 git add 失败：{result.stderr.strip()}"

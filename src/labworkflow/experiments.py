@@ -691,6 +691,7 @@ def adopt_experiment(
                 )
             elif gitutil.is_repo(path):
                 gitutil.write_excludes(path)
+                gitutil.configure_repo(path)
                 record["git"] = True
                 result.git_message = "沿用已有 git 仓库（未提交）"
                 dirty = gitutil.status_lines(path) or []

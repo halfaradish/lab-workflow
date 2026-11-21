@@ -450,6 +450,7 @@ def copy_tree_rendered(source: Path, destination: Path, mapping: dict[str, objec
         ".cfg",
         ".ini",
         ".gitignore",
+        ".gitattributes",
     }
     for item in _template_entries(source):
         target = destination / item.name

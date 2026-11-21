@@ -331,6 +331,45 @@ class LabCase(unittest.TestCase):
         self.assertIn("没有 pip", outcome.warnings[0])
         self.assertIn("依赖未安装", environment.environment_summary(record))
 
+    def test_gitattributes_and_quotepath(self) -> None:
+        self.init()
+        subprocess.run(
+            ["git", "init", "-q", str(self.lab_root)],
+            check=True, capture_output=True, text=True,
+        )
+        self.assert_ok(self.run_lab("init"))
+        configured = subprocess.run(
+            ["git", "-C", str(self.lab_root), "config", "--get", "core.quotepath"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(configured.stdout.strip(), "false")
+
+        identifier = self.create("Line Endings", "--template", "python")
+        path = self.exp_path(self.record(identifier))
+        attributes = (path / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("* text=auto", attributes)
+        checked = subprocess.run(
+            ["git", "-C", str(path), "check-attr", "text", "--", "data.csv"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertIn("text: auto", checked.stdout)
+
+        (path / "data.csv").write_bytes(b"a,b\r\n1,2\r\n")
+        added = subprocess.run(
+            ["git", "-C", str(path), "-c", "core.autocrlf=true", "add", "data.csv"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertNotIn("CRLF will be replaced", added.stderr)
+
+        (path / "中文数据.csv").write_text("name,value\n", encoding="utf-8")
+        status = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        self.assertIn("中文数据.csv", status.stdout)
+        self.assertNotIn("\\346", status.stdout)
+
     def test_init_creates_skeleton_and_is_idempotent(self) -> None:
         proc = self.run_lab("init")
         self.assert_ok(proc)

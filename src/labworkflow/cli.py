@@ -100,6 +100,7 @@ def _format_age_days(value: float) -> str:
 def cmd_init(args, workspace: Workspace) -> int:
     created = workspace.ensure()
     refreshed = workspace.refresh() if args.refresh else []
+    gitutil.configure_repo(workspace.root)
     print(f"工作台: {workspace.root}")
     if created:
         print("已创建/补齐:")
