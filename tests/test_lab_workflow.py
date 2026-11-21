@@ -495,9 +495,13 @@ class LabCase(unittest.TestCase):
         self.assertEqual(registry_path.read_text(encoding="utf-8"), registry_before)
         self.assertEqual(readme_path.read_text(encoding="utf-8"), readme_before)
 
+        # Move updated_at into the past so the comparison is not bound to
+        # one-second timestamp resolution.
+        self.backdate(identifier, 1, field="updated_at")
+        stale = self.record(identifier)["updated_at"]
         changed = self.run_lab("meta", identifier, "--summary", "new value")
         self.assert_ok(changed)
-        self.assertNotEqual(self.record(identifier)["updated_at"], updated_before)
+        self.assertNotEqual(self.record(identifier)["updated_at"], stale)
         self.assertIn("new value", readme_path.read_text(encoding="utf-8"))
 
     def test_custom_readme_sections_survive(self) -> None:
