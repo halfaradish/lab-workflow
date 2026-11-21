@@ -270,6 +270,46 @@ class LabCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("工作台不存在", proc.stderr)
 
+    def test_reference_accepts_directory_name_and_prefix(self) -> None:
+        self.init()
+        first = self.create("Demo One")
+        second = self.create("Demo Two")
+        first_record = self.record(first)
+        second_record = self.record(second)
+        directory = Path(first_record["path"]).name
+        date = first_record["id"].split("-")[0]
+        sequence = int(first_record["id"].split("-")[1])
+        shorthand = f"{date}-{sequence}-{first_record['slug']}"
+
+        shown = self.run_lab("show", directory)
+        self.assert_ok(shown)
+        self.assertIn(first, shown.stdout)
+
+        shown = self.run_lab("show", shorthand)
+        self.assert_ok(shown)
+        self.assertIn(first, shown.stdout)
+
+        renamed = self.run_lab("status", directory, "running")
+        self.assert_ok(renamed)
+        self.assertEqual(self.record(first)["status"], "running")
+
+        updated = self.run_lab("meta", directory, "--summary", "通过目录名更新")
+        self.assert_ok(updated)
+        self.assertEqual(self.record(first)["summary"], "通过目录名更新")
+
+        archived = self.run_lab("archive", directory)
+        self.assert_ok(archived)
+        self.assertEqual(self.record(first)["status"], "archived")
+
+        prefix = self.run_lab("show", second_record["slug"][:6])
+        self.assert_ok(prefix)
+        self.assertIn(second, prefix.stdout)
+
+        ambiguous = self.run_lab("show", date)
+        self.assertEqual(ambiguous.returncode, 1, ambiguous.stderr)
+        self.assertIn(first, ambiguous.stderr)
+        self.assertIn(second, ambiguous.stderr)
+
     # ------------------------------------------------------------------
     # status / meta / search
     # ------------------------------------------------------------------

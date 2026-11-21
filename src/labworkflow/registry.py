@@ -11,15 +11,41 @@ from .util import ACTIVE_STATUSES, ALL_STATUSES, now_iso, now_local
 from .workspace import Workspace
 
 ID_RE = re.compile(r"^(\d{8})-(\d{1,3})$")
+# Also normalize the id prefix of a directory-style reference such as
+# ``20261120-1-demo`` so shorthand works with directory names too.
+EMBEDDED_ID_RE = re.compile(r"^(\d{8})-(\d{1,3})(?=-)")
 
 
 def normalize_ref(value: str) -> str:
     """Accept ``20261120-1`` as shorthand for ``20261120-001``."""
 
-    match = ID_RE.match(value.strip())
+    text = value.strip()
+    match = ID_RE.match(text)
     if match:
         return f"{match.group(1)}-{int(match.group(2)):03d}"
-    return value.strip()
+    match = EMBEDDED_ID_RE.match(text)
+    if match:
+        return f"{match.group(1)}-{int(match.group(2)):03d}{text[match.end():]}"
+    return text
+
+
+def _reference_forms(record: dict[str, Any]) -> set[str]:
+    """Values a user may type to address one experiment.
+
+    Besides the canonical id and slug, experiments are commonly referenced
+    by their directory name (``20261120-001-demo``), which is exactly
+    ``<id>-<slug>`` for created experiments and may differ for adopted ones.
+    """
+
+    identifier = str(record.get("id") or "")
+    slug = str(record.get("slug") or "")
+    forms = {identifier, slug}
+    if identifier and slug:
+        forms.add(f"{identifier}-{slug}")
+    path = str(record.get("path") or "").replace("\\", "/").rstrip("/")
+    if path:
+        forms.add(path.rsplit("/", 1)[-1])
+    return {form for form in forms if form}
 
 
 class Registry:
@@ -77,6 +103,12 @@ class Registry:
         for record in records:
             if record.get("id") == normalized:
                 return record
+        # Adopted experiments keep their original directory name, which may
+        # not follow the <id>-<slug> convention. Accept it as an exact alias.
+        for record in records:
+            forms = _reference_forms(record)
+            if reference in forms:
+                return record
         slug_matches = [r for r in records if r.get("slug") == reference]
         if len(slug_matches) == 1:
             return slug_matches[0]
@@ -87,6 +119,18 @@ class Registry:
             matches = slug_matches or name_matches
             ids = ", ".join(str(item.get("id")) for item in matches)
             raise LabError(f"标识 '{reference}' 对应多个实验，请使用 id: {ids}")
+        prefix_matches = [
+            record
+            for record in records
+            if any(form.startswith(normalized) for form in _reference_forms(record))
+        ]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+        if len(prefix_matches) > 1:
+            ids = ", ".join(str(item.get("id")) for item in prefix_matches)
+            raise LabError(
+                f"标识 '{reference}' 匹配多个实验，请使用更精确的 id: {ids}"
+            )
         raise NotFoundError(f"找不到实验 '{reference}'")
 
     def next_id(self, records: list[dict[str, Any]] | None = None, *, when=None) -> str:
