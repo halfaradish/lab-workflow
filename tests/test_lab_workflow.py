@@ -28,6 +28,14 @@ PYTHON = sys.executable
 ID_RE = re.compile(r"实验已创建: (\d{8}-\d{3})")
 
 
+def replace_managed_block(text: str, name: str, content: str) -> str:
+    pattern = re.compile(
+        rf"(<!-- lab:{name}:start -->\n).*?(\n<!-- lab:{name}:end -->)",
+        re.DOTALL,
+    )
+    return pattern.sub(lambda match: match.group(1) + content + match.group(2), text, count=1)
+
+
 @unittest.skipUnless(shutil.which("git"), "git is required for end-to-end tests")
 class LabCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -355,6 +363,72 @@ class LabCase(unittest.TestCase):
 
         empty_meta = self.run_lab("meta", identifier)
         self.assertEqual(empty_meta.returncode, 2, empty_meta.stderr)
+
+    def test_manual_conclusion_is_adopted_instead_of_overwritten(self) -> None:
+        self.init()
+        identifier = self.create("Manual Conclusion", "--template", "general")
+        readme = self.exp_path(self.record(identifier)) / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        text = replace_managed_block(text, "conclusion", "手工写的结论：这个方向值得继续。")
+        readme.write_text(text, encoding="utf-8")
+
+        proc = self.run_lab("status", identifier, "running")
+        self.assert_ok(proc)
+        self.assertIn("已采纳", proc.stderr)
+        self.assertEqual(self.record(identifier)["conclusion"], "手工写的结论：这个方向值得继续。")
+        self.assertIn("手工写的结论：这个方向值得继续。", readme.read_text(encoding="utf-8"))
+
+        explicit = self.run_lab("meta", identifier, "--conclusion", "显式结论覆盖")
+        self.assert_ok(explicit)
+        self.assertEqual(self.record(identifier)["conclusion"], "显式结论覆盖")
+        self.assertNotIn("手工写的结论", readme.read_text(encoding="utf-8"))
+        self.assertIn("显式结论覆盖", readme.read_text(encoding="utf-8"))
+
+    def test_manual_metadata_edit_warns_and_strict_refuses(self) -> None:
+        self.init()
+        identifier = self.create("Strict Metadata", "--template", "general")
+        readme = self.exp_path(self.record(identifier)) / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        match = re.search(
+            r"<!-- lab:metadata:start -->\n(.*?)\n<!-- lab:metadata:end -->", text, re.DOTALL
+        )
+        self.assertIsNotNone(match)
+        edited = match.group(1) + "\n\n| 手工字段 | 请保留 |"
+        text = text[: match.start(1)] + edited + text[match.end(1):]
+        readme.write_text(text, encoding="utf-8")
+
+        strict = self.run_lab("meta", identifier, "--summary", "x", "--strict")
+        self.assertEqual(strict.returncode, 4, strict.stderr)
+        self.assertIn("拒绝覆盖", strict.stderr)
+        self.assertIn("手工字段", readme.read_text(encoding="utf-8"))
+        self.assertEqual(self.record(identifier)["summary"], "")
+
+        loose = self.run_lab("meta", identifier, "--summary", "x")
+        self.assert_ok(loose)
+        self.assertIn("元数据区块", loose.stderr)
+        self.assertNotIn("手工字段", readme.read_text(encoding="utf-8"))
+        self.assertEqual(self.record(identifier)["summary"], "x")
+
+        clean = self.run_lab("meta", identifier, "--summary", "y", "--strict")
+        self.assert_ok(clean)
+        self.assertEqual(self.record(identifier)["summary"], "y")
+
+    def test_adopt_readme_flag_pulls_description_into_registry(self) -> None:
+        self.init()
+        identifier = self.create("Adopt Description", "--template", "general")
+        readme = self.exp_path(self.record(identifier)) / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        text = replace_managed_block(text, "description", "手写描述：验证缓存命中率。")
+        readme.write_text(text, encoding="utf-8")
+
+        adopted = self.run_lab("meta", identifier, "--adopt-readme")
+        self.assert_ok(adopted)
+        self.assertIn("已采纳", adopted.stderr)
+        self.assertEqual(self.record(identifier)["description"], "手写描述：验证缓存命中率。")
+        self.assertIn("手写描述：验证缓存命中率。", readme.read_text(encoding="utf-8"))
+
+        conflict = self.run_lab("meta", identifier, "--adopt-readme", "--strict")
+        self.assertEqual(conflict.returncode, 2, conflict.stderr)
 
     def test_status_history_is_recorded_and_shown(self) -> None:
         self.init()

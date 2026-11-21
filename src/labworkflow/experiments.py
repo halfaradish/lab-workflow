@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -48,6 +49,8 @@ from .workspace import (
 README_ASSET = ASSET_ROOT / "experiment_README.md"
 META_FILENAME = ".lab-meta.json"
 MANAGED_READMES = ("metadata", "description", "conclusion")
+DESCRIPTION_PLACEHOLDER = "_（待补充：一句话说明这个实验想验证什么。）_"
+CONCLUSION_PLACEHOLDER = "_（待补充：实验结束或 promote 前写下结论。）_"
 
 
 @dataclass
@@ -74,6 +77,7 @@ class UpdateResult:
     previous_status: str = ""
     warnings: list[str] = field(default_factory=list)
     changed: bool = True
+    adopted: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -138,12 +142,12 @@ def metadata_block(record: dict[str, Any]) -> str:
 
 def description_block(record: dict[str, Any]) -> str:
     text = str(record.get("description") or "").strip()
-    return text if text else "_（待补充：一句话说明这个实验想验证什么。）_"
+    return text if text else DESCRIPTION_PLACEHOLDER
 
 
 def conclusion_block(record: dict[str, Any]) -> str:
     text = str(record.get("conclusion") or "").strip()
-    return text if text else "_（待补充：实验结束或 promote 前写下结论。）_"
+    return text if text else CONCLUSION_PLACEHOLDER
 
 
 def render_readme(workspace: Workspace, record: dict[str, Any]) -> str:
@@ -179,6 +183,114 @@ def _replace_managed(text: str, name: str, content: str) -> tuple[str, bool]:
         return f"{match.group(1)}\n{content}\n{match.group(2)}"
 
     return pattern.sub(replace, text, count=1), True
+
+
+def read_managed_block(text: str, name: str) -> str | None:
+    """Return the content between one managed marker pair, if present."""
+
+    pattern = re.compile(
+        rf"<!--\s*lab:{re.escape(name)}:start\s*-->(.*?)"
+        rf"<!--\s*lab:{re.escape(name)}:end\s*-->",
+        re.DOTALL,
+    )
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _render_managed_block(name: str, record: dict[str, Any]) -> str:
+    if name == "metadata":
+        return metadata_block(record)
+    if name == "description":
+        return description_block(record)
+    return conclusion_block(record)
+
+
+def reconcile_readme(
+    workspace: Workspace,
+    record: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    adopt_description: bool = False,
+    protected: tuple[str, ...] = (),
+    strict: bool = False,
+) -> tuple[list[str], list[str], list[str]]:
+    """Detect hand edits in managed blocks before the next render.
+
+    ``previous`` is the registry snapshot whose rendered blocks were last
+    written to disk. Comparing against it avoids false positives from the
+    tool's own changes (status, updated_at). Returns ``(warnings, adopted,
+    conflicts)``; ``record`` is updated in place when content is adopted.
+
+    The conclusion and description blocks are plain user prose, so a
+    non-empty hand edit can be pulled back into the registry. The metadata
+    block is tool-owned and is always regenerated from the registry.
+    """
+
+    path = workspace.experiment_path(record)
+    if path is None:
+        return [], [], []
+    readme = path / "README.md"
+    if not readme.is_file():
+        return [], [], []
+    try:
+        text = readme.read_text(encoding="utf-8")
+    except OSError:
+        return [], [], []
+
+    blocks: dict[str, str] = {}
+    for name in MANAGED_READMES:
+        disk = read_managed_block(text, name)
+        if disk is None:
+            continue
+        if disk == _render_managed_block(name, previous).strip():
+            continue
+        blocks[name] = disk
+    if not blocks:
+        return [], [], []
+
+    conflicts = list(blocks)
+    if strict:
+        names = ", ".join(conflicts)
+        raise StateError(
+            f"README 受管区块存在手工修改: {names}；--strict 已拒绝覆盖。"
+            "受支持的内容可用 meta --adopt-readme 采纳，或先把内容写入 registry"
+        )
+
+    warnings: list[str] = []
+    adopted: list[str] = []
+    for name, disk in blocks.items():
+        empty = not disk or disk in {DESCRIPTION_PLACEHOLDER, CONCLUSION_PLACEHOLDER}
+        if name == "conclusion":
+            if name not in protected and not empty:
+                record["conclusion"] = disk
+                adopted.append("conclusion")
+                warnings.append("README 结论区块有手工修改，已采纳到 registry（未覆盖）")
+            elif name in protected:
+                warnings.append("README 结论区块的手工内容已被 --conclusion 覆盖")
+            else:
+                warnings.append(
+                    "README 结论区块与 registry 不一致，已按 registry 重新渲染"
+                )
+        elif name == "description":
+            if adopt_description and name not in protected and not empty:
+                record["description"] = disk
+                adopted.append("description")
+                warnings.append("README 描述区块有手工修改，已采纳到 registry（未覆盖）")
+            elif name in protected:
+                warnings.append("README 描述区块的手工内容已被 --description 覆盖")
+            else:
+                warnings.append(
+                    "README 描述区块有手工修改，将按 registry 重新渲染；"
+                    "如需保留请用 meta --adopt-readme"
+                )
+        else:
+            warnings.append(
+                "README 元数据区块有手工修改，将按 registry 重新渲染；"
+                "请用 meta 更新元数据"
+            )
+    return warnings, adopted, conflicts
 
 
 def sync_readme(workspace: Workspace, record: dict[str, Any]) -> list[str]:
@@ -562,6 +674,10 @@ def adopt_experiment(
                     result.warnings.append(
                         "README 已存在但没有 lab-workflow 标记块，元数据不会同步进 README"
                     )
+                else:
+                    snapshot = copy.deepcopy(record)
+                    warnings, _, _ = reconcile_readme(workspace, record, snapshot)
+                    result.warnings.extend(warnings)
             if ensure_agents_link(workspace, path) == "copy":
                 result.warnings.append(
                     "文件系统不支持符号链接，AGENTS.md 已复制（工作台规则更新后需手动同步）"
@@ -757,11 +873,18 @@ def update_status(workspace: Workspace, reference: str, status: str) -> UpdateRe
         check_editable(record)
         previous = str(record.get("status", ""))
         if previous == wanted:
-            return UpdateResult(record=record, previous_status=previous)
+            return UpdateResult(record=record, previous_status=previous, changed=False)
+        snapshot = copy.deepcopy(record)
         set_status(record, wanted)
+        warnings, adopted, _ = reconcile_readme(workspace, record, snapshot)
         registry.write_record(record)
-        warnings = _sync_all(workspace, record)
-    return UpdateResult(record=record, previous_status=previous, warnings=warnings)
+        warnings.extend(_sync_all(workspace, record))
+    return UpdateResult(
+        record=record,
+        previous_status=previous,
+        warnings=warnings,
+        adopted=adopted,
+    )
 
 
 def update_meta(
@@ -775,18 +898,21 @@ def update_meta(
     tags: list[str] | None = None,
     technologies: list[str] | None = None,
     related_projects: list[str] | None = None,
+    adopt_readme: bool = False,
+    strict: bool = False,
 ) -> UpdateResult:
     provided = [
         value
         for value in (description, summary, conclusion, category, tags, technologies, related_projects)
         if value is not None
     ]
-    if not provided:
+    if not provided and not adopt_readme:
         raise UsageError("至少提供一个要更新的字段")
     with workspace.lock():
         registry = Registry(workspace)
         record = find_experiment(workspace, reference, registry.load())
         check_editable(record)
+        snapshot = copy.deepcopy(record)
         updates: dict[str, Any] = {}
         if description is not None:
             updates["description"] = description.strip()
@@ -811,16 +937,34 @@ def update_meta(
                 return [str(item) for item in (current or [])] == value
             return str(current or "") == value
 
-        if all(unchanged(key, value) for key, value in updates.items()):
+        protected = tuple(
+            name
+            for name, value in (("description", description), ("conclusion", conclusion))
+            if value is not None
+        )
+        record.update(updates)
+        warnings, adopted, conflicts = reconcile_readme(
+            workspace,
+            record,
+            snapshot,
+            adopt_description=adopt_readme,
+            protected=protected,
+            strict=strict,
+        )
+        if record == snapshot and not conflicts:
             # No field changed: leave registry, README and mirror untouched
             # instead of bumping updated_at and rewriting identical files.
-            return UpdateResult(record=record, changed=False)
+            return UpdateResult(record=record, changed=False, warnings=warnings)
 
-        record.update(updates)
         touch(record)
         registry.write_record(record)
-        warnings = _sync_all(workspace, record)
-    return UpdateResult(record=record, warnings=warnings, changed=True)
+        warnings.extend(_sync_all(workspace, record))
+    return UpdateResult(
+        record=record,
+        warnings=warnings,
+        changed=True,
+        adopted=adopted,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -862,6 +1006,8 @@ def archive_experiment(workspace: Workspace, reference: str, *, force: bool = Fa
             raise StateError(f"归档目标已存在: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         previous_status = record.get("status")
+        snapshot = copy.deepcopy(record)
+        warnings, _, _ = reconcile_readme(workspace, record, snapshot)
         try:
             shutil.move(str(source), str(target))
         except OSError as exc:
@@ -878,7 +1024,7 @@ def archive_experiment(workspace: Workspace, reference: str, *, force: bool = Fa
             except OSError:
                 pass
             raise
-        warnings = _sync_all(workspace, record)
+        warnings.extend(_sync_all(workspace, record))
     return ArchiveResult(record=record, path=target, dirty=dirty, warnings=warnings)
 
 
@@ -989,6 +1135,9 @@ def promote_experiment(
             if any(destination.iterdir()):
                 raise StateError(f"promote 目标目录非空，请换一个空目录: {destination}")
 
+        snapshot = copy.deepcopy(record)
+        warnings, _, _ = reconcile_readme(workspace, record, snapshot)
+
         created_target = not destination.exists()
         try:
             _copy_project(source, destination)
@@ -1031,7 +1180,7 @@ def promote_experiment(
             if created_target:
                 compat.safe_rmtree(destination, ignore_errors=True)
             raise
-        warnings = _sync_all(workspace, record)
+        warnings.extend(_sync_all(workspace, record))
     return PromoteResult(
         record=record,
         target=destination,

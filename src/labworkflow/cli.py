@@ -335,10 +335,12 @@ def cmd_status(args, workspace: Workspace) -> int:
 def cmd_meta(args, workspace: Workspace) -> int:
     values = [args.description, args.summary, args.conclusion, args.category]
     values.extend([args.tags, args.technologies, args.related_projects])
-    if all(value is None for value in values):
+    if args.adopt_readme and args.strict:
+        raise UsageError("--adopt-readme 与 --strict 不能同时使用")
+    if all(value is None for value in values) and not args.adopt_readme:
         raise UsageError(
             "至少提供一个字段: --description/--summary/--conclusion/--category/"
-            "--tags/--technologies/--related-projects"
+            "--tags/--technologies/--related-projects，或使用 --adopt-readme"
         )
     result = experiments.update_meta(
         workspace,
@@ -352,6 +354,8 @@ def cmd_meta(args, workspace: Workspace) -> int:
         related_projects=split_csv(args.related_projects)
         if args.related_projects is not None
         else None,
+        adopt_readme=args.adopt_readme,
+        strict=args.strict,
     )
     _warn(result.warnings)
     if args.json:
@@ -361,6 +365,8 @@ def cmd_meta(args, workspace: Workspace) -> int:
         print(f"实验 {result.record.get('id')} 元数据无变化")
         return 0
     fields = []
+    if result.adopted:
+        fields.append("/".join(label for label in result.adopted))
     for label, value in (
         ("描述", args.description),
         ("摘要", args.summary),
@@ -803,6 +809,16 @@ def build_parser() -> LabParser:
     p.add_argument("--tags", action="append", help="标签列表（替换原值；可重复/逗号分隔）")
     p.add_argument("--technologies", action="append", help="技术栈列表（替换原值）")
     p.add_argument("--related-projects", action="append", dest="related_projects", help="相关项目列表（替换原值）")
+    p.add_argument(
+        "--adopt-readme",
+        action="store_true",
+        help="把 README 描述/结论区块的手工修改采纳到 registry",
+    )
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="README 受管区块有手工修改时拒绝覆盖并退出",
+    )
     p.add_argument("--json", action="store_true", help="输出 JSON")
     p.set_defaults(func=cmd_meta)
 
