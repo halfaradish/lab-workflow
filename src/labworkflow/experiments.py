@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -72,6 +73,7 @@ class UpdateResult:
     record: dict[str, Any]
     previous_status: str = ""
     warnings: list[str] = field(default_factory=list)
+    changed: bool = True
 
 
 @dataclass
@@ -218,8 +220,16 @@ def write_meta(workspace: Workspace, record: dict[str, Any]) -> list[str]:
     path = workspace.experiment_path(record)
     if path is None or not path.exists():
         return []
+    target = path / META_FILENAME
     try:
-        atomic_write_json(path / META_FILENAME, record)
+        if target.is_file():
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            if existing == record:
+                return []
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        atomic_write_json(target, record)
     except OSError as exc:
         return [f"无法写入 .lab-meta.json: {exc}"]
     return []
@@ -777,26 +787,40 @@ def update_meta(
         registry = Registry(workspace)
         record = find_experiment(workspace, reference, registry.load())
         check_editable(record)
+        updates: dict[str, Any] = {}
         if description is not None:
-            record["description"] = description.strip()
+            updates["description"] = description.strip()
         if summary is not None:
-            record["summary"] = summary.strip()
+            updates["summary"] = summary.strip()
         if conclusion is not None:
-            record["conclusion"] = conclusion.strip()
+            updates["conclusion"] = conclusion.strip()
         if category is not None:
-            record["category"] = category.strip()
+            updates["category"] = category.strip()
         if tags is not None:
-            record["tags"] = unique(tag.strip() for tag in tags if tag.strip())
+            updates["tags"] = unique(tag.strip() for tag in tags if tag.strip())
         if technologies is not None:
-            record["technologies"] = unique(item.strip() for item in technologies if item.strip())
+            updates["technologies"] = unique(item.strip() for item in technologies if item.strip())
         if related_projects is not None:
-            record["related_projects"] = unique(
+            updates["related_projects"] = unique(
                 item.strip() for item in related_projects if item.strip()
             )
+
+        def unchanged(key: str, value: Any) -> bool:
+            current = record.get(key)
+            if key in {"tags", "technologies", "related_projects"}:
+                return [str(item) for item in (current or [])] == value
+            return str(current or "") == value
+
+        if all(unchanged(key, value) for key, value in updates.items()):
+            # No field changed: leave registry, README and mirror untouched
+            # instead of bumping updated_at and rewriting identical files.
+            return UpdateResult(record=record, changed=False)
+
+        record.update(updates)
         touch(record)
         registry.write_record(record)
         warnings = _sync_all(workspace, record)
-    return UpdateResult(record=record, warnings=warnings)
+    return UpdateResult(record=record, warnings=warnings, changed=True)
 
 
 # ----------------------------------------------------------------------

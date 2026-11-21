@@ -357,6 +357,9 @@ def cmd_meta(args, workspace: Workspace) -> int:
     if args.json:
         _json_print(_record_json(workspace, result.record))
         return 0
+    if not result.changed:
+        print(f"实验 {result.record.get('id')} 元数据无变化")
+        return 0
     fields = []
     for label, value in (
         ("描述", args.description),

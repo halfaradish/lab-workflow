@@ -391,6 +391,41 @@ class LabCase(unittest.TestCase):
         self.assert_ok(self.run_lab("status", identifier, "running"))
         self.assertEqual(len(self.record(identifier)["history"]), 1)
 
+    def test_repeated_meta_and_status_do_not_rewrite_files(self) -> None:
+        self.init()
+        identifier = self.create("No Noise", "--template", "general")
+        self.assert_ok(self.run_lab("status", identifier, "running"))
+        self.assert_ok(
+            self.run_lab(
+                "meta", identifier, "--summary", "stable", "--tags", "a,b"
+            )
+        )
+        registry_path = self.lab_root / "registry" / "experiments.jsonl"
+        readme_path = self.exp_path(self.record(identifier)) / "README.md"
+        registry_before = registry_path.read_text(encoding="utf-8")
+        readme_before = readme_path.read_text(encoding="utf-8")
+        updated_before = self.record(identifier)["updated_at"]
+
+        again = self.run_lab(
+            "meta", identifier, "--summary", " stable ", "--tags", "a,b"
+        )
+        self.assert_ok(again)
+        self.assertIn("元数据无变化", again.stdout)
+        self.assertEqual(registry_path.read_text(encoding="utf-8"), registry_before)
+        self.assertEqual(readme_path.read_text(encoding="utf-8"), readme_before)
+        self.assertEqual(self.record(identifier)["updated_at"], updated_before)
+
+        same_status = self.run_lab("status", identifier, "running")
+        self.assert_ok(same_status)
+        self.assertIn("状态未变化", same_status.stdout)
+        self.assertEqual(registry_path.read_text(encoding="utf-8"), registry_before)
+        self.assertEqual(readme_path.read_text(encoding="utf-8"), readme_before)
+
+        changed = self.run_lab("meta", identifier, "--summary", "new value")
+        self.assert_ok(changed)
+        self.assertNotEqual(self.record(identifier)["updated_at"], updated_before)
+        self.assertIn("new value", readme_path.read_text(encoding="utf-8"))
+
     def test_custom_readme_sections_survive(self) -> None:
         self.init()
         identifier = self.create("Readme Keep", "--template", "general")
