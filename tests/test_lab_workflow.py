@@ -718,17 +718,17 @@ class LabCase(unittest.TestCase):
         self.assertIn(str(custom), proc.stdout)
         self.assertIn("--root", proc.stdout)
 
-        for parent in (".agent", ".agents"):
-            skill = custom / parent / "skills" / "lab-management" / "SKILL.md"
-            self.assertTrue(skill.is_file(), skill)
-            text = skill.read_text(encoding="utf-8")
-            self.assertIn("name: lab-management", text)
-            self.assertIn(str(custom), text)
-            expected_cmd = LAB.with_suffix(".cmd") if os.name == "nt" else LAB
-            self.assertIn(str(expected_cmd.resolve()), text)
-            self.assertNotIn("{{", text)
+        skill = custom / ".agents" / "skills" / "lab-management" / "SKILL.md"
+        self.assertTrue(skill.is_file(), skill)
+        text = skill.read_text(encoding="utf-8")
+        self.assertIn("name: lab-management", text)
+        self.assertIn(str(custom), text)
+        expected_cmd = LAB.with_suffix(".cmd") if os.name == "nt" else LAB
+        self.assertIn(str(expected_cmd.resolve()), text)
+        self.assertNotIn("{{", text)
+        self.assertFalse((custom / ".agent").exists())
 
-        reference = custom / ".agent" / "skills" / "lab-management" / "references" / "commands.md"
+        reference = custom / ".agents" / "skills" / "lab-management" / "references" / "commands.md"
         self.assertTrue(reference.is_file())
         self.assertNotIn("{{", reference.read_text(encoding="utf-8"))
 
@@ -760,7 +760,6 @@ class LabCase(unittest.TestCase):
         custom = (self.home / "custom-lab").resolve()
         self.assert_ok(self.run_lab("init", str(custom)))
         skills = [
-            custom / ".agent" / "skills" / "lab-management" / "SKILL.md",
             custom / ".agents" / "skills" / "lab-management" / "SKILL.md",
         ]
         for skill in skills:

@@ -62,8 +62,7 @@ try-rs
 ├── registry/
 │   └── experiments.jsonl  # 元数据，registry 是权威来源
 ├── bin/                   # 预留；第一版为空
-├── .agent/skills/lab-management/   # 权威 skill 副本
-└── .agents/skills/lab-management/  # 通用 Agent 运行时发现路径的兼容副本
+└── .agents/skills/lab-management/  # 通用 Agent 运行时发现路径的 skill 副本
 ```
 
 每个实验目录包含：

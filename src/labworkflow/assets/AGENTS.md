@@ -42,7 +42,7 @@ promote、清理。它**不提供 TUI**。
 常用命令：`init`、`new`、`adopt`、`list`、`show`、`open`、`status`、`meta`、
 `archive`、`promote`、`discard`、`clean`、`stats`、`search`、`doctor`。
 
-工作台自带 `lab-management` skill（`.agent/skills/lab-management/`）。做实验时优先
+工作台自带 `lab-management` skill（`.agents/skills/lab-management/`）。做实验时优先
 按该 skill 的流程执行：先写目标契约，用最小实现验证，再总结和归档。
 
 ## 与 try-rs 的分工

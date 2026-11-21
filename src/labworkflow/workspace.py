@@ -16,7 +16,7 @@ ASSET_ROOT = Path(__file__).resolve().parent / "assets"
 TEMPLATE_ROOT = ASSET_ROOT / "templates"
 SKILL_ROOT = ASSET_ROOT / "skills"
 SKILL_NAME = "lab-management"
-SKILL_PARENTS = (".agent/skills", ".agents/skills")
+SKILL_PARENTS = (".agents/skills",)
 ROOT_ENV = "LAB_WORKFLOW_ROOT"
 AGENTS_MARKER = "<!-- lab:workspace-agents -->"
 MANAGED_ASSETS = {
@@ -195,10 +195,9 @@ class Workspace:
     def install_skills(self, *, refresh: bool) -> list[str]:
         """Install the bundled project-level skills into this workspace.
 
-        Both ``.agent`` (canonical per workspace convention) and ``.agents``
-        (the generic agent-runtime discovery path) receive a real copy. Copies keep
-        Windows free of symlink-privilege requirements and can be refreshed
-        together with the other managed assets.
+        ``.agents/skills`` — the vendor-neutral agent-runtime discovery path —
+        receives a real copy. Copies keep Windows free of symlink-privilege
+        requirements and can be refreshed together with the other managed assets.
         """
 
         source = SKILL_ROOT / SKILL_NAME

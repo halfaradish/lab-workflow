@@ -138,9 +138,9 @@ cd "$(./bin/lab-workflow open websocket-test)"
 # ./bin/lab-workflow promote websocket-test --to ~/workspace/websocket-test
 ```
 
-`init` 还会把 `lab-management` skill 安装到工作台的 `.agent/skills/` 和
-`.agents/skills/`。后者是通用 Agent 运行时的发现路径；`init --refresh` 会同时更新
-两份。skill 里预留了工作台根目录和 CLI 路径，安装时按当前机器渲染。
+`init` 还会把 `lab-management` skill 安装到工作台的 `.agents/skills/`——通用
+Agent 运行时的发现路径；`init --refresh` 会同步更新这份副本。skill 里预留了工作台
+根目录和 CLI 路径，安装时按当前机器渲染。
 
 ### Windows
 
@@ -259,8 +259,7 @@ discarded_at, discarded_reason, discarded_from_status
 ├── templates/              # python / node / general
 ├── registry/experiments.jsonl
 ├── bin/                    # 预留，不生成全局命令
-├── .agent/skills/lab-management/   # 权威 skill 副本
-└── .agents/skills/lab-management/  # 兼容副本（通用 Agent 运行时发现路径）
+└── .agents/skills/lab-management/  # skill 副本（通用 Agent 运行时发现路径）
 ```
 
 实验 README 使用受管理的标记块（`<!-- lab:metadata:start -->` 等）同步元数据。
